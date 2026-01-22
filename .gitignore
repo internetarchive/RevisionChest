@@ -1,5 +1,7 @@
+.idea/
 target/
 *.7z
 *.bz2
 *.zst
 .DS_Store
+
