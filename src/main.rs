@@ -1,28 +1,35 @@
 use bzip2::read::BzDecoder;
+use chrono::Local;
+use clap::Parser;
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
-use std::env;
-use std::fs::File;
-use std::io::{self, BufReader, Read};
+use rayon::prelude::*;
+use std::fs::{self, File};
+use std::io::{self, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
 
-fn main() -> io::Result<()> {
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage: {} <wikipedia_dump.xml.bz2|7z>", args[0]);
-        std::process::exit(1);
-    }
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Wikipedia dump file (.bz2 or .7z)
+    input: Option<PathBuf>,
 
-    let path = &args[1];
-    let input_reader: Box<dyn Read> = if path.ends_with(".7z") {
-        let mut reader = sevenz_rust::SevenZReader::open(path, sevenz_rust::Password::empty())
+    /// Directory containing Wikipedia dump files
+    #[arg(short = 'd')]
+    input_dir: Option<PathBuf>,
+
+    /// Output directory for .mwrev.zst files
+    #[arg(short = 'o')]
+    output_dir: Option<PathBuf>,
+}
+
+fn process_file(input_path: &Path, output_dir: Option<&Path>) -> io::Result<()> {
+    let filename = input_path.file_name().unwrap().to_string_lossy();
+    eprintln!("[{}] Starting {}", Local::now().format("%Y-%m-%d %H:%M:%S"), filename);
+
+    let input_reader: Box<dyn Read> = if input_path.extension().map_or(false, |ext| ext == "7z") {
+        let mut reader = sevenz_rust::SevenZReader::open(input_path, sevenz_rust::Password::empty())
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-        // Since we expect one file in the 7z (Wikipedia dump), we read the first one.
-        // Unfortunately sevenz-rust seems to require reading the whole entry into memory
-        // or extracting to disk if we want to treat it as a stream easily, 
-        // because SevenZReader::read_values uses a callback.
-        
-        // Let's try to find if there is a better way. 
-        // Actually, Wikipedia 7z can be very large.
         
         let mut first_file_content = Vec::new();
         reader.for_each_entries(|entry, reader| {
@@ -35,8 +42,24 @@ fn main() -> io::Result<()> {
         
         Box::new(io::Cursor::new(first_file_content))
     } else {
-        let file = File::open(path)?;
+        let file = File::open(input_path)?;
         Box::new(BzDecoder::new(file))
+    };
+
+    let mut writer: Box<dyn Write> = if let Some(out_dir) = output_dir {
+        fs::create_dir_all(out_dir)?;
+        let mut out_name = filename.to_string();
+        if out_name.ends_with(".bz2") {
+            out_name = out_name.strip_suffix(".bz2").unwrap().to_string();
+        } else if out_name.ends_with(".7z") {
+            out_name = out_name.strip_suffix(".7z").unwrap().to_string();
+        }
+        out_name.push_str(".mwrev.zst");
+        let out_path = out_dir.join(out_name);
+        let file = File::create(out_path)?;
+        Box::new(zstd::Encoder::new(file, 0)?.auto_finish())
+    } else {
+        Box::new(io::stdout())
     };
 
     let mut reader = Reader::from_reader(BufReader::new(input_reader));
@@ -66,7 +89,6 @@ fn main() -> io::Result<()> {
                     "page" => in_page = true,
                     "revision" => {
                         in_revision = true;
-                        // Clear revision metadata at start of revision
                         rev_id.clear();
                         parent_rev_id.clear();
                         timestamp.clear();
@@ -88,20 +110,17 @@ fn main() -> io::Result<()> {
                     }
                     "revision" => {
                         in_revision = false;
-                        
-                        // Default user_id to "0" if it was not found in <contributor>
                         let display_user_id = if user_id.is_empty() { "0" } else { &user_id };
 
-                        // Print the mwrev format
-                        println!(
+                        writeln!(
+                            writer,
                             "# page_id={} ns={} rev_id={} parent_rev_id={} timestamp={} user_id={}",
                             current_page_id, current_ns, rev_id, parent_rev_id, timestamp, display_user_id
-                        );
+                        )?;
                         for line in text.lines() {
-                            println!(" {}", line);
+                            writeln!(writer, " {}", line)?;
                         }
 
-                        // Clear revision metadata
                         rev_id.clear();
                         parent_rev_id.clear();
                         timestamp.clear();
@@ -156,6 +175,38 @@ fn main() -> io::Result<()> {
             _ => {}
         }
         buf.clear();
+    }
+
+    eprintln!("[{}] Finished {}", Local::now().format("%Y-%m-%d %H:%M:%S"), filename);
+    Ok(())
+}
+
+fn main() -> io::Result<()> {
+    let args = Args::parse();
+
+    if let Some(input_dir) = args.input_dir {
+        let output_dir = args.output_dir.as_deref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "-o is required when using -d")
+        })?;
+
+        let entries: Vec<PathBuf> = fs::read_dir(input_dir)?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.is_file() && (path.extension() == Some("bz2".as_ref()) || path.extension() == Some("7z".as_ref()))
+            })
+            .collect();
+
+        entries.into_par_iter().for_each(|path| {
+            if let Err(e) = process_file(&path, Some(output_dir)) {
+                eprintln!("Error processing {:?}: {}", path, e);
+            }
+        });
+    } else if let Some(input_path) = args.input {
+        process_file(&input_path, args.output_dir.as_deref())?;
+    } else {
+        eprintln!("Usage: RevisionChest <wikipedia_dump.xml.bz2|7z> OR -d <input_dir> -o <output_dir>");
+        std::process::exit(1);
     }
 
     Ok(())
