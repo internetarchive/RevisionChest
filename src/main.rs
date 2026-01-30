@@ -52,7 +52,6 @@ fn db_worker(rx: Receiver<DbMessage>, db_path: PathBuf) {
     while let Ok(msg) = rx.recv() {
         batch.push(msg);
         if batch.len() >= 10000 || (rx.is_empty() && !batch.is_empty()) {
-            let count = batch.len();
             let tx = conn.transaction().expect("Failed to start transaction");
             for m in batch.drain(..) {
                 match m {
@@ -78,7 +77,6 @@ fn db_worker(rx: Receiver<DbMessage>, db_path: PathBuf) {
                 }
             }
             tx.commit().expect("Failed to commit transaction");
-            eprintln!("[{}] Committed transaction with {} records", Local::now().format("%Y-%m-%d %H:%M:%S"), count);
         }
     }
 }
