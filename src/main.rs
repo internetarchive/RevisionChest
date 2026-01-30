@@ -347,7 +347,13 @@ fn process_file(
 fn main() -> io::Result<()> {
     let args = Args::parse();
     let (db_tx, db_rx) = crossbeam_channel::unbounded();
-    let db_path = args.db.clone();
+    let mut db_path = args.db.clone();
+
+    if let Some(ref output_dir) = args.output_dir {
+        if db_path.is_relative() {
+            db_path = output_dir.join(db_path);
+        }
+    }
 
     let db_thread = thread::spawn(move || {
         db_worker(db_rx, db_path);
