@@ -3,5 +3,8 @@ target/
 *.7z
 *.bz2
 *.zst
+*.db
+*.db-shm
+*.db-wal
 .DS_Store
 
