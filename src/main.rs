@@ -2,7 +2,7 @@ use bzip2::read::BzDecoder;
 use chrono::Local;
 use clap::Parser;
 use crossbeam_channel::{Receiver, Sender};
-use postgres::{Client, NoTls};
+use postgres::{Client, NoTls, Transaction};
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use rayon::prelude::*;
@@ -13,6 +13,120 @@ use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 use url::Url;
+
+fn process_pg_page(tx: &mut Transaction, id: u64, ns: i32, title: String, container_id: i32, entity_id: i32) {
+    let domain_label = tx
+        .query_one("SELECT label FROM concepts WHERE id = $1", &[&container_id])
+        .expect("Failed to get domain label")
+        .get::<_, String>(0);
+    let page_label = format!("{}:{}", domain_label, id);
+
+    // page_concept_id: label like "{domain}:{page_id}"
+    let row = tx.query_opt("SELECT id FROM concepts WHERE label = $1", &[&page_label])
+        .expect("Failed to check for page concept");
+    let concept_id: i32 = match row {
+        Some(r) => r.get(0),
+        None => {
+            let insert_row = tx.query_one("INSERT INTO concepts (label) VALUES ($1) RETURNING id", &[&page_label])
+                .expect("Failed to insert page concept");
+            insert_row.get(0)
+        }
+    };
+
+    tx.execute(
+        "INSERT INTO documents (id, title, numeric_page_id, numeric_namespace_id, has_container)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (numeric_page_id, has_container) DO UPDATE SET
+           title = EXCLUDED.title,
+           numeric_namespace_id = EXCLUDED.numeric_namespace_id",
+        &[&concept_id, &title, &(id as i64), &ns, &container_id],
+    )
+    .expect("Failed to upsert document");
+
+    // Fetch the canonical concept id for this document (it may be the existing row’s id)
+    let doc_concept_id: i32 = tx
+        .query_one(
+            "SELECT id FROM documents WHERE numeric_page_id = $1 AND has_container = $2",
+            &[&(id as i64), &container_id],
+        )
+        .expect("Failed to fetch canonical document concept id")
+        .get(0);
+
+    // web_resource_concept_id: label like "{domain}:{page_id} (on web)"
+    let web_label = format!("{} (on web)", page_label);
+    let row = tx.query_opt("SELECT id FROM concepts WHERE label = $1", &[&web_label])
+        .expect("Failed to check for web resource concept");
+    let web_concept_id: i32 = match row {
+        Some(r) => r.get(0),
+        None => {
+            let insert_row = tx.query_one("INSERT INTO concepts (label) VALUES ($1) RETURNING id", &[&web_label])
+                .expect("Failed to insert web resource concept");
+            insert_row.get(0)
+        }
+    };
+    let web_url = format!("https://{}/w/index.php?curid={}", domain_label, id);
+
+    tx.execute(
+        "INSERT INTO web_resources (id, url, instance_of_document, domain, is_archive_of)
+         VALUES ($1, $2, $3, $4, NULL)
+         ON CONFLICT (url) DO UPDATE SET
+           instance_of_document = EXCLUDED.instance_of_document,
+           domain = EXCLUDED.domain",
+        &[&web_concept_id, &web_url, &doc_concept_id, &entity_id],
+    )
+    .expect("Failed to upsert web resource");
+}
+
+fn process_pg_revision(
+    tx: &mut Transaction,
+    rev_id: u64,
+    parent_rev_id: Option<u64>,
+    page_id: u64,
+    file_path: String,
+    offset_begin: u64,
+    offset_end: u64,
+    timestamp: String,
+    bundle_cache: &mut HashMap<String, i32>,
+) {
+    let bundle_id = if let Some(&id) = bundle_cache.get(&file_path) {
+        id
+    } else {
+        let id: i32 = tx.query_one(
+            "INSERT INTO revision_bundles (file_path)
+             VALUES ($1)
+             ON CONFLICT (file_path) DO UPDATE SET file_path = EXCLUDED.file_path
+             RETURNING id",
+            &[&file_path],
+        )
+        .expect("Failed to upsert revision bundle")
+        .get(0);
+        bundle_cache.insert(file_path, id);
+        id
+    };
+
+    tx.execute(
+        "INSERT INTO revisions (
+          revision_id, page_id, found_in_bundle, offset_begin, offset_end, parent_revision_id, revision_timestamp
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (revision_id) DO UPDATE SET
+          page_id = EXCLUDED.page_id,
+          found_in_bundle = EXCLUDED.found_in_bundle,
+          offset_begin = EXCLUDED.offset_begin,
+          offset_end = EXCLUDED.offset_end,
+          parent_revision_id = EXCLUDED.parent_revision_id,
+          revision_timestamp = EXCLUDED.revision_timestamp",
+        &[
+            &(rev_id as i64),
+            &(page_id as i64),
+            &bundle_id,
+            &(offset_begin as i64),
+            &(offset_end as i64),
+            &parent_rev_id.map(|id| id as i64),
+            &timestamp,
+        ],
+    )
+    .expect("Failed to upsert revision");
+}
 
 #[derive(Debug)]
 enum DbMessage {
@@ -31,6 +145,7 @@ enum DbMessage {
         file_path: String,
         offset_begin: u64,
         offset_end: u64,
+        timestamp: String,
     },
 }
 
@@ -48,7 +163,7 @@ fn db_worker(rx: Receiver<DbMessage>, db_path: PathBuf) {
         let mut client = Client::connect(&conn_str, NoTls).expect("Failed to connect to PostgreSQL");
 
         // Verify that tables exist instead of creating them
-        let tables = ["concepts", "documents", "revision_bundles", "revisions", "web_resources"];
+        let tables = ["concepts", "documents", "revision_bundles", "revisions", "web_resources", "domains"];
         for table in &tables {
             let row_exists: bool = client
                 .query_one(
@@ -96,8 +211,10 @@ fn db_worker(rx: Receiver<DbMessage>, db_path: PathBuf) {
         None
     };
 
-    let mut domain_concept_id = None;
+    let mut domain_container_concept_id = None;
+    let mut domain_entity_concept_id = None;
     let mut bundle_cache: HashMap<String, i32> = HashMap::new();
+    let mut pending_messages: Vec<DbMessage> = Vec::new();
 
     let mut batch = Vec::with_capacity(10000);
     while let Ok(msg) = rx.recv() {
@@ -105,78 +222,69 @@ fn db_worker(rx: Receiver<DbMessage>, db_path: PathBuf) {
         if batch.len() >= 10000 || (rx.is_empty() && !batch.is_empty()) {
             if let Some(ref mut client) = pg_client {
                 let mut tx = client.transaction().expect("Failed to start PG transaction");
-                for m in batch.drain(..) {
+                let current_batch: Vec<DbMessage> = batch.drain(..).collect();
+                for m in current_batch {
                     match m {
                         DbMessage::SiteInfo { domain } => {
-                            let row = tx
-                                .query_one(
-                                    "INSERT INTO concepts (label) VALUES ($1) ON CONFLICT (label) DO UPDATE SET label = EXCLUDED.label RETURNING id",
-                                    &[&domain],
-                                )
-                                .expect("Failed to insert domain concept");
-                            domain_concept_id = Some(row.get::<_, i32>(0));
-                        }
-                        DbMessage::Page { id, ns, title } => {
-                            if domain_concept_id.is_none() {
-                                // Try to find the domain concept if it was already inserted in a previous run
-                                // Since we don't have the domain name here, we can't easily find it
-                                // unless we assume there's only one domain concept or we pass domain name with every Page msg.
-                                // However, most XML dumps have siteinfo at the beginning.
-                                eprintln!("Warning: Received Page before SiteInfo in current batch. Attempting to proceed if domain was already set.");
-                            }
-                            let domain_id = match domain_concept_id {
-                                Some(id) => id,
+                            // domain_container_concept_id: label like "{domain}"
+                            let row = tx.query_opt("SELECT id FROM concepts WHERE label = $1", &[&domain])
+                                .expect("Failed to check for domain container concept");
+                            let container_id: i32 = match row {
+                                Some(r) => r.get(0),
                                 None => {
-                                    // If we really don't have it, skip.
-                                    0
+                                    let insert_row = tx.query_one("INSERT INTO concepts (label) VALUES ($1) RETURNING id", &[&domain])
+                                        .expect("Failed to insert domain container concept");
+                                    insert_row.get(0)
                                 }
                             };
-                            if domain_id == 0 {
-                                // We didn't get a domain yet.
-                                // It's better to ignore or log an error.
-                                eprintln!("Warning: Received Page before SiteInfo. Skipping.");
-                                continue;
-                            }
-                            let domain_label = tx
-                                .query_one("SELECT label FROM concepts WHERE id = $1", &[&domain_id])
-                                .expect("Failed to get domain label")
-                                .get::<_, String>(0);
-                            let page_label = format!("{}:{}", domain_label, id);
+                            domain_container_concept_id = Some(container_id);
 
-                            let concept_row = tx
-                                .query_one(
-                                    "INSERT INTO concepts (label) VALUES ($1) ON CONFLICT (label) DO UPDATE SET label = EXCLUDED.label RETURNING id",
-                                    &[&page_label],
-                                )
-                                .expect("Failed to insert page concept");
-                            let concept_id: i32 = concept_row.get(0);
+                            // domain_entity_concept_id: label like "{domain} (domain)"
+                            let entity_label = format!("{} (domain)", domain);
+                            let row = tx.query_opt("SELECT id FROM concepts WHERE label = $1", &[&entity_label])
+                                .expect("Failed to check for domain entity concept");
+                            let entity_id: i32 = match row {
+                                Some(r) => r.get(0),
+                                None => {
+                                    let insert_row = tx.query_one("INSERT INTO concepts (label) VALUES ($1) RETURNING id", &[&entity_label])
+                                        .expect("Failed to insert domain entity concept");
+                                    insert_row.get(0)
+                                }
+                            };
+                            domain_entity_concept_id = Some(entity_id);
 
+                            // Upsert domains row
                             tx.execute(
-                                "INSERT INTO documents (id, title, numeric_page_id, numeric_namespace_id, has_container)
+                                "INSERT INTO domains (id, value, top_level_domain, parent_domain, for_container)
                                  VALUES ($1, $2, $3, $4, $5)
-                                 ON CONFLICT (id) DO NOTHING",
-                                &[&concept_id, &title, &(id as i64), &ns, &domain_id],
-                            )
-                            .ok();
+                                 ON CONFLICT (value) DO UPDATE SET
+                                   id = EXCLUDED.id,
+                                   top_level_domain = COALESCE(EXCLUDED.top_level_domain, domains.top_level_domain),
+                                   parent_domain = COALESCE(EXCLUDED.parent_domain, domains.parent_domain),
+                                   for_container = COALESCE(EXCLUDED.for_container, domains.for_container)",
+                                &[&entity_id, &domain, &Option::<String>::None, &Option::<i32>::None, &container_id],
+                            ).expect("Failed to upsert domain");
 
-                            // Create web resource
-                            let web_label = format!("{} (on web)", page_label);
-                            let web_concept_row = tx
-                                .query_one(
-                                    "INSERT INTO concepts (label) VALUES ($1) ON CONFLICT (label) DO UPDATE SET label = EXCLUDED.label RETURNING id",
-                                    &[&web_label],
-                                )
-                                .expect("Failed to insert web resource concept");
-                            let web_concept_id: i32 = web_concept_row.get(0);
-                            let web_url = format!("https://{}/w/index.php?curid={}", domain_label, id);
-
-                            tx.execute(
-                                "INSERT INTO web_resources (id, url, instance_of_document)
-                                 VALUES ($1, $2, $3)
-                                 ON CONFLICT (id) DO NOTHING",
-                                &[&web_concept_id, &web_url, &concept_id],
-                            )
-                            .ok();
+                            // Process pending messages now that we have siteinfo
+                            let pending = std::mem::take(&mut pending_messages);
+                            for pm in pending {
+                                match pm {
+                                    DbMessage::Page { id, ns, title } => {
+                                        process_pg_page(&mut tx, id, ns, title, domain_container_concept_id.unwrap(), domain_entity_concept_id.unwrap());
+                                    }
+                                    DbMessage::Revision { rev_id, parent_rev_id, page_id, file_path, offset_begin, offset_end, timestamp } => {
+                                        process_pg_revision(&mut tx, rev_id, parent_rev_id, page_id, file_path, offset_begin, offset_end, timestamp, &mut bundle_cache);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        DbMessage::Page { id, ns, title } => {
+                            if let (Some(container_id), Some(entity_id)) = (domain_container_concept_id, domain_entity_concept_id) {
+                                process_pg_page(&mut tx, id, ns, title, container_id, entity_id);
+                            } else {
+                                pending_messages.push(DbMessage::Page { id, ns, title });
+                            }
                         }
                         DbMessage::Revision {
                             rev_id,
@@ -185,35 +293,21 @@ fn db_worker(rx: Receiver<DbMessage>, db_path: PathBuf) {
                             file_path,
                             offset_begin,
                             offset_end,
+                            timestamp,
                         } => {
-                            let bundle_id = if let Some(&id) = bundle_cache.get(&file_path) {
-                                id
+                            if domain_container_concept_id.is_some() {
+                                process_pg_revision(&mut tx, rev_id, parent_rev_id, page_id, file_path, offset_begin, offset_end, timestamp, &mut bundle_cache);
                             } else {
-                                let row = tx
-                                    .query_one(
-                                        "INSERT INTO revision_bundles (file_path) VALUES ($1) ON CONFLICT (file_path) DO UPDATE SET file_path = EXCLUDED.file_path RETURNING id",
-                                        &[&file_path],
-                                    )
-                                    .expect("Failed to insert revision bundle");
-                                let id: i32 = row.get(0);
-                                bundle_cache.insert(file_path, id);
-                                id
-                            };
-
-                            tx.execute(
-                                "INSERT INTO revisions (revision_id, page_id, revision_bundle_id, offset_begin, offset_end, parent_revision_id)
-                                 VALUES ($1, $2, $3, $4, $5, $6)
-                                 ON CONFLICT (revision_id) DO NOTHING",
-                                &[
-                                    &(rev_id as i64),
-                                    &(page_id as i64),
-                                    &bundle_id,
-                                    &(offset_begin as i64),
-                                    &(offset_end as i64),
-                                    &parent_rev_id.map(|id| id as i64),
-                                ],
-                            )
-                            .ok();
+                                pending_messages.push(DbMessage::Revision {
+                                    rev_id,
+                                    parent_rev_id,
+                                    page_id,
+                                    file_path,
+                                    offset_begin,
+                                    offset_end,
+                                    timestamp,
+                                });
+                            }
                         }
                     }
                 }
@@ -448,6 +542,7 @@ fn process_file(
                                 file_path: out_name,
                                 offset_begin,
                                 offset_end,
+                                timestamp: timestamp.clone(),
                             }).ok();
 
                             rev_id.clear();
