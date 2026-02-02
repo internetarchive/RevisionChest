@@ -7,4 +7,4 @@ target/
 *.db-shm
 *.db-wal
 .DS_Store
-
+.env
