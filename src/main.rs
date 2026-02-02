@@ -197,10 +197,14 @@ fn db_worker(rx: Receiver<DbMessage>, db_path: PathBuf) {
                  ns INTEGER,
                  title TEXT
              );
+             CREATE TABLE IF NOT EXISTS files (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 path TEXT UNIQUE
+             );
              CREATE TABLE IF NOT EXISTS revisions (
                  rev_id INTEGER PRIMARY KEY,
                  page_id INTEGER,
-                 file_path TEXT,
+                 file_id INTEGER,
                  offset_begin INTEGER,
                  offset_end INTEGER
              );",
@@ -214,6 +218,7 @@ fn db_worker(rx: Receiver<DbMessage>, db_path: PathBuf) {
     let mut domain_container_concept_id = None;
     let mut domain_entity_concept_id = None;
     let mut bundle_cache: HashMap<String, i32> = HashMap::new();
+    let mut file_cache: HashMap<String, i64> = HashMap::new();
     let mut pending_messages: Vec<DbMessage> = Vec::new();
 
     let mut batch = Vec::with_capacity(10000);
@@ -332,9 +337,28 @@ fn db_worker(rx: Receiver<DbMessage>, db_path: PathBuf) {
                             offset_end,
                             ..
                         } => {
+                            let file_id = if let Some(&id) = file_cache.get(&file_path) {
+                                id
+                            } else {
+                                tx.execute(
+                                    "INSERT OR IGNORE INTO files (path) VALUES (?1)",
+                                    params![file_path],
+                                )
+                                .ok();
+                                let id: i64 = tx
+                                    .query_row(
+                                        "SELECT id FROM files WHERE path = ?1",
+                                        params![file_path],
+                                        |row| row.get(0),
+                                    )
+                                    .expect("Failed to get file id");
+                                file_cache.insert(file_path, id);
+                                id
+                            };
+
                             tx.execute(
-                                "INSERT OR IGNORE INTO revisions (rev_id, page_id, file_path, offset_begin, offset_end) VALUES (?1, ?2, ?3, ?4, ?5)",
-                                params![rev_id, page_id, file_path, offset_begin, offset_end],
+                                "INSERT OR IGNORE INTO revisions (rev_id, page_id, file_id, offset_begin, offset_end) VALUES (?1, ?2, ?3, ?4, ?5)",
+                                params![rev_id, page_id, file_id, offset_begin, offset_end],
                             ).ok();
                         }
                     }
