@@ -678,7 +678,7 @@ fn main() -> io::Result<()> {
             io::Error::new(io::ErrorKind::InvalidInput, "-o is required when using -d")
         })?;
 
-        let entries: Vec<PathBuf> = fs::read_dir(input_dir)?
+        let mut entries: Vec<PathBuf> = fs::read_dir(input_dir)?
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.path())
             .filter(|path| {
@@ -686,9 +686,14 @@ fn main() -> io::Result<()> {
             })
             .collect();
 
+        entries.sort();
+
         let total_files = entries.len();
-        entries.into_par_iter().enumerate().for_each(|(i, path)| {
-            if let Err(e) = process_file(&path, Some(output_dir), &args.namespace, &db_tx, i + 1, total_files) {
+        let started_count = std::sync::atomic::AtomicUsize::new(0);
+
+        entries.into_par_iter().for_each(|path| {
+            let file_index = started_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if let Err(e) = process_file(&path, Some(output_dir), &args.namespace, &db_tx, file_index, total_files) {
                 eprintln!("Error processing {:?}: {}", path, e);
             }
         });
