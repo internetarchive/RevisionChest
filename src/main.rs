@@ -397,9 +397,17 @@ fn process_file(
     output_dir: Option<&Path>,
     allowed_namespaces: &Option<Vec<String>>,
     db_tx: &Sender<DbMessage>,
+    file_index: usize,
+    total_files: usize,
 ) -> io::Result<()> {
     let filename = input_path.file_name().unwrap().to_string_lossy();
-    eprintln!("[{}] Starting {}", Local::now().format("%Y-%m-%d %H:%M:%S"), filename);
+    eprintln!(
+        "[{}] Starting {} ({}/{})",
+        Local::now().format("%Y-%m-%d %H:%M:%S"),
+        filename,
+        file_index,
+        total_files
+    );
 
     let input_reader: Box<dyn Read> = if input_path.extension().map_or(false, |ext| ext == "7z") {
         let mut reader = sevenz_rust::SevenZReader::open(input_path, sevenz_rust::Password::empty())
@@ -640,7 +648,13 @@ fn process_file(
         buf.clear();
     }
 
-    eprintln!("[{}] Finished {}", Local::now().format("%Y-%m-%d %H:%M:%S"), filename);
+    eprintln!(
+        "[{}] Finished {} ({}/{})",
+        Local::now().format("%Y-%m-%d %H:%M:%S"),
+        filename,
+        file_index,
+        total_files
+    );
     Ok(())
 }
 
@@ -672,8 +686,9 @@ fn main() -> io::Result<()> {
             })
             .collect();
 
-        entries.into_par_iter().for_each(|path| {
-            if let Err(e) = process_file(&path, Some(output_dir), &args.namespace, &db_tx) {
+        let total_files = entries.len();
+        entries.into_par_iter().enumerate().for_each(|(i, path)| {
+            if let Err(e) = process_file(&path, Some(output_dir), &args.namespace, &db_tx, i + 1, total_files) {
                 eprintln!("Error processing {:?}: {}", path, e);
             }
         });
@@ -683,6 +698,8 @@ fn main() -> io::Result<()> {
             args.output_dir.as_deref(),
             &args.namespace,
             &db_tx,
+            1,
+            1,
         )?;
     } else {
         eprintln!("Usage: RevisionChest <wikipedia_dump.xml.bz2|7z> OR -d <input_dir> -o <output_dir>");
