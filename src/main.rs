@@ -117,10 +117,10 @@ fn process_pg_revision(
           revision_timestamp = EXCLUDED.revision_timestamp",
         &[
             &(rev_id as i64),
-            &(page_id as i64),
+            &(page_id as i32),
             &bundle_id,
-            &(offset_begin as i64),
-            &(offset_end as i64),
+            &(offset_begin as i32),
+            &(offset_end as i32),
             &parent_rev_id.map(|id| id as i64),
             &timestamp,
         ],
