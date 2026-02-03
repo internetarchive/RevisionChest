@@ -288,6 +288,9 @@ fn db_worker(rx: Receiver<DbMessage>, db_path: PathBuf) {
                             if let (Some(container_id), Some(entity_id)) = (domain_container_concept_id, domain_entity_concept_id) {
                                 process_pg_page(&mut tx, id, ns, title, container_id, entity_id);
                             } else {
+                                if pending_messages.len() > 100_000 {
+                                    panic!("Too many pending messages without SiteInfo. SiteInfo must be provided at the beginning of the XML dump.");
+                                }
                                 pending_messages.push(DbMessage::Page { id, ns, title });
                             }
                         }
@@ -303,6 +306,9 @@ fn db_worker(rx: Receiver<DbMessage>, db_path: PathBuf) {
                             if domain_container_concept_id.is_some() {
                                 process_pg_revision(&mut tx, rev_id, parent_rev_id, page_id, file_path, offset_begin, offset_end, timestamp, &mut bundle_cache);
                             } else {
+                                if pending_messages.len() > 100_000 {
+                                    panic!("Too many pending messages without SiteInfo. SiteInfo must be provided at the beginning of the XML dump.");
+                                }
                                 pending_messages.push(DbMessage::Revision {
                                     rev_id,
                                     parent_rev_id,
@@ -390,6 +396,10 @@ struct Args {
     /// SQLite database file
     #[arg(long, default_value = "index.db")]
     db: PathBuf,
+
+    /// Override or specify the wiki domain (e.g., en.wikipedia.org)
+    #[arg(long)]
+    domain: Option<String>,
 }
 
 fn process_file(
@@ -399,6 +409,7 @@ fn process_file(
     db_tx: &Sender<DbMessage>,
     file_index: usize,
     total_files: usize,
+    skip_siteinfo: bool,
 ) -> io::Result<()> {
     let filename = input_path.file_name().unwrap().to_string_lossy();
     eprintln!(
@@ -593,7 +604,7 @@ fn process_file(
                 let content = e.unescape().unwrap_or_default().into_owned();
                 match current_tag.as_str() {
                     "base" => {
-                        if in_siteinfo {
+                        if in_siteinfo && !skip_siteinfo {
                             if let Ok(url) = Url::parse(&content) {
                                 if let Some(domain) = url.domain() {
                                     db_tx.send(DbMessage::SiteInfo { domain: domain.to_string() }).ok();
@@ -660,7 +671,7 @@ fn process_file(
 
 fn main() -> io::Result<()> {
     let args = Args::parse();
-    let (db_tx, db_rx) = crossbeam_channel::unbounded();
+    let (db_tx, db_rx) = crossbeam_channel::bounded(10000);
     let mut db_path = args.db.clone();
 
     if let Some(ref output_dir) = args.output_dir {
@@ -672,6 +683,13 @@ fn main() -> io::Result<()> {
     let db_thread = thread::spawn(move || {
         db_worker(db_rx, db_path);
     });
+
+    let skip_siteinfo = if let Some(domain) = args.domain.clone() {
+        db_tx.send(DbMessage::SiteInfo { domain }).ok();
+        true
+    } else {
+        false
+    };
 
     if let Some(input_dir) = args.input_dir {
         let output_dir = args.output_dir.as_deref().ok_or_else(|| {
@@ -693,7 +711,7 @@ fn main() -> io::Result<()> {
 
         entries.into_par_iter().for_each(|path| {
             let file_index = started_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-            if let Err(e) = process_file(&path, Some(output_dir), &args.namespace, &db_tx, file_index, total_files) {
+            if let Err(e) = process_file(&path, Some(output_dir), &args.namespace, &db_tx, file_index, total_files, skip_siteinfo) {
                 eprintln!("Error processing {:?}: {}", path, e);
             }
         });
@@ -705,6 +723,7 @@ fn main() -> io::Result<()> {
             &db_tx,
             1,
             1,
+            skip_siteinfo,
         )?;
     } else {
         eprintln!("Usage: RevisionChest <wikipedia_dump.xml.bz2|7z> OR -d <input_dir> -o <output_dir>");
