@@ -39,7 +39,7 @@ fn process_pg_page(tx: &mut Transaction, id: u64, ns: i32, title: String, contai
          ON CONFLICT (numeric_page_id, has_container) DO UPDATE SET
            title = EXCLUDED.title,
            numeric_namespace_id = EXCLUDED.numeric_namespace_id",
-        &[&concept_id, &title, &(id as i64), &ns, &container_id],
+        &[&concept_id, &title, &(id as i32), &ns, &container_id],
     )
     .expect("Failed to upsert document");
 
@@ -47,7 +47,7 @@ fn process_pg_page(tx: &mut Transaction, id: u64, ns: i32, title: String, contai
     let doc_concept_id: i32 = tx
         .query_one(
             "SELECT id FROM documents WHERE numeric_page_id = $1 AND has_container = $2",
-            &[&(id as i64), &container_id],
+            &[&(id as i32), &container_id],
         )
         .expect("Failed to fetch canonical document concept id")
         .get(0);
