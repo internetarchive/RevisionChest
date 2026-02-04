@@ -11,6 +11,8 @@ pub fn process_pg_batch(
     batch: Vec<DbMessage>,
     domain_id_atomic: &Arc<std::sync::atomic::AtomicI32>,
     domain_label_cached: &Arc<RwLock<Option<String>>>,
+    bundle_cache: &Arc<RwLock<HashMap<String, i32>>>,
+    page_title_cache: &Arc<RwLock<HashMap<u64, String>>>,
 ) {
     let mut retry_count = 0;
     let max_retries = 5;
@@ -43,7 +45,6 @@ pub fn process_pg_batch(
 
         let mut rev_data = Vec::new();
         let mut page_data = Vec::new();
-        let mut bundle_cache: HashMap<String, i32> = HashMap::new();
         let mut seen_pages = std::collections::HashSet::new();
 
         tx.execute(
@@ -63,6 +64,10 @@ pub fn process_pg_batch(
                         let row = format!("{}\t{}\t{}\n", *id as i32, ns, sanitize_copy_text(title));
                         page_data.extend_from_slice(row.as_bytes());
                     }
+                    {
+                        let mut lock = page_title_cache.write().unwrap();
+                        lock.insert(*id, title.clone());
+                    }
                 }
                 DbMessage::Revision {
                     rev_id,
@@ -73,7 +78,12 @@ pub fn process_pg_batch(
                     offset_end,
                     timestamp,
                 } => {
-                    let bundle_id = if let Some(&id) = bundle_cache.get(file_path) {
+                    let cached_id = {
+                        let lock = bundle_cache.read().unwrap();
+                        lock.get(file_path).copied()
+                    };
+
+                    let bundle_id = if let Some(id) = cached_id {
                         id
                     } else {
                         let bundle_id_res = tx.query_one(
@@ -87,7 +97,10 @@ pub fn process_pg_batch(
                         match bundle_id_res {
                             Ok(row) => {
                                 let id: i32 = row.get(0);
-                                bundle_cache.insert(file_path.clone(), id);
+                                {
+                                    let mut lock = bundle_cache.write().unwrap();
+                                    lock.insert(file_path.clone(), id);
+                                }
                                 id
                             }
                             Err(e) => {
@@ -119,6 +132,59 @@ pub fn process_pg_batch(
                     );
                     rev_data.extend_from_slice(row.as_bytes());
                 }
+                DbMessage::Finalize => {
+                    let cached = {
+                        let mut lock = page_title_cache.write().unwrap();
+                        std::mem::take(&mut *lock)
+                    };
+
+                    if !cached.is_empty() {
+                        let mut finalize_page_data = Vec::new();
+                        for (id, title) in &cached {
+                            let row = format!("{}\t{}\n", *id as i32, sanitize_copy_text(title));
+                            finalize_page_data.extend_from_slice(row.as_bytes());
+                        }
+
+                        let finalize_res = (|| {
+                            tx.execute(
+                                "CREATE TEMP TABLE temp_finalize_pages (
+                                    id INTEGER,
+                                    title TEXT
+                                ) ON COMMIT DROP",
+                                &[],
+                            )?;
+
+                            let mut writer = tx.copy_in("COPY temp_finalize_pages (id, title) FROM STDIN")?;
+                            writer.write_all(&finalize_page_data)?;
+                            writer.finish()?;
+
+                            tx.execute(
+                                "INSERT INTO documents (title)
+                                 SELECT DISTINCT title FROM temp_finalize_pages
+                                 ON CONFLICT DO NOTHING",
+                                &[],
+                            )?;
+
+                            tx.execute(
+                                "UPDATE web_resources
+                                 SET instance_of_document = d.id
+                                 FROM temp_finalize_pages tfp
+                                 JOIN documents d ON d.title = tfp.title
+                                 WHERE web_resources.numeric_page_id = tfp.id 
+                                   AND web_resources.instance_of_document IS NULL",
+                                &[],
+                            )?;
+
+                            Ok::<(), Box<dyn std::error::Error>>(())
+                        })();
+
+                        if let Err(e) = finalize_res {
+                            eprintln!("Finalize pages failed: {:?}. Retrying...", e);
+                            success = false;
+                            break;
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -145,8 +211,8 @@ pub fn process_pg_batch(
                 tx.execute(
                     &format!(
                         "INSERT INTO web_resources (url, numeric_page_id, numeric_namespace_id, domain_id, instance_of_document)
-                         SELECT 'https://' || $1 || '/w/index.php?curid=' || id, id, ns, $2, NULL
-                         FROM temp_pages
+                         SELECT 'https://' || $1 || '/w/index.php?curid=' || tp.id, tp.id, tp.ns, $2, NULL
+                         FROM temp_pages tp
                          ON CONFLICT (url) DO UPDATE SET
                             numeric_page_id = EXCLUDED.numeric_page_id,
                             numeric_namespace_id = EXCLUDED.numeric_namespace_id,

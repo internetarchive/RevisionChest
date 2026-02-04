@@ -53,6 +53,8 @@ pub fn db_worker(rx: Receiver<DbMessage>, db_path: PathBuf) {
 
         let domain_id = Arc::new(std::sync::atomic::AtomicI32::new(0));
         let domain_label_cached = Arc::new(RwLock::new(None));
+        let bundle_cache: Arc<RwLock<HashMap<String, i32>>> = Arc::new(RwLock::new(HashMap::new()));
+        let page_title_cache: Arc<RwLock<HashMap<u64, String>>> = Arc::new(RwLock::new(HashMap::new()));
 
         let mut pending_messages: Vec<DbMessage> = Vec::new();
         let mut sub_worker_txs: Vec<Sender<Vec<DbMessage>>> = Vec::new();
@@ -63,10 +65,12 @@ pub fn db_worker(rx: Receiver<DbMessage>, db_path: PathBuf) {
             let pool_clone = pool.clone();
             let domain_id_clone = domain_id.clone();
             let domain_label_clone = domain_label_cached.clone();
+            let bundle_cache_clone = bundle_cache.clone();
+            let page_title_cache_clone = page_title_cache.clone();
 
             let handle = thread::spawn(move || {
                 while let Ok(batch) = sub_rx.recv() {
-                    process_pg_batch(&pool_clone, batch, &domain_id_clone, &domain_label_clone);
+                    process_pg_batch(&pool_clone, batch, &domain_id_clone, &domain_label_clone, &bundle_cache_clone, &page_title_cache_clone);
                 }
             });
             sub_worker_txs.push(tx);
@@ -183,6 +187,7 @@ pub fn db_worker(rx: Receiver<DbMessage>, db_path: PathBuf) {
     .expect("Failed to initialize SQLite database");
 
     let mut bundle_cache: HashMap<String, i64> = HashMap::new();
+    let mut page_title_cache: HashMap<u64, String> = HashMap::new();
     let mut domain_id: Option<i64> = None;
     let mut domain_label: Option<String> = None;
     let mut batch = Vec::with_capacity(10000);
@@ -212,7 +217,7 @@ pub fn db_worker(rx: Receiver<DbMessage>, db_path: PathBuf) {
                 for m in pending {
                     batch.push(m);
                     if batch.len() >= 10000 {
-                        process_sqlite_batch(&conn, &mut batch, &mut bundle_cache, domain_id, domain_label.as_deref());
+                        process_sqlite_batch(&conn, &mut batch, &mut bundle_cache, &mut page_title_cache, domain_id, domain_label.as_deref());
                     }
                 }
             }
@@ -222,7 +227,7 @@ pub fn db_worker(rx: Receiver<DbMessage>, db_path: PathBuf) {
                 } else {
                     batch.push(msg);
                     if batch.len() >= 10000 {
-                        process_sqlite_batch(&conn, &mut batch, &mut bundle_cache, domain_id, domain_label.as_deref());
+                        process_sqlite_batch(&conn, &mut batch, &mut bundle_cache, &mut page_title_cache, domain_id, domain_label.as_deref());
                     }
                 }
             }
@@ -230,6 +235,6 @@ pub fn db_worker(rx: Receiver<DbMessage>, db_path: PathBuf) {
     }
 
     if !batch.is_empty() {
-        process_sqlite_batch(&conn, &mut batch, &mut bundle_cache, domain_id, domain_label.as_deref());
+        process_sqlite_batch(&conn, &mut batch, &mut bundle_cache, &mut page_title_cache, domain_id, domain_label.as_deref());
     }
 }

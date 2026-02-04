@@ -6,6 +6,7 @@ pub fn process_sqlite_batch(
     conn: &Connection,
     batch: &mut Vec<DbMessage>,
     bundle_cache: &mut HashMap<String, i64>,
+    page_title_cache: &mut HashMap<u64, String>,
     domain_id: Option<i64>,
     domain_label: Option<&str>,
 ) {
@@ -14,11 +15,6 @@ pub fn process_sqlite_batch(
     for m in batch.drain(..) {
         match m {
             DbMessage::Page { id, ns, title } => {
-                tx.execute(
-                    "INSERT OR IGNORE INTO documents (title) VALUES (?1)",
-                    params![title],
-                ).ok();
-
                 if let (Some(did), Some(dlabel)) = (domain_id, domain_label) {
                     let url = format!("https://{}/w/index.php?curid={}", dlabel, id);
                     tx.execute(
@@ -31,6 +27,7 @@ pub fn process_sqlite_batch(
                         params![url, id as i64, ns, did],
                     ).ok();
                 }
+                page_title_cache.insert(id, title);
             }
             DbMessage::Revision {
                 rev_id,
@@ -62,6 +59,20 @@ pub fn process_sqlite_batch(
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![rev_id as i64, page_id as i64, b_id, offset_begin as i64, offset_end as i64, parent_rev_id.map(|id| id as i64), timestamp],
                 ).ok();
+            }
+            DbMessage::Finalize => {
+                for (page_id, title) in page_title_cache.drain() {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO documents (title) VALUES (?1)",
+                        params![title],
+                    ).ok();
+                    tx.execute(
+                        "UPDATE web_resources 
+                         SET instance_of_document = (SELECT id FROM documents WHERE title = ?1)
+                         WHERE numeric_page_id = ?2 AND instance_of_document IS NULL",
+                        params![title, page_id as i64],
+                    ).ok();
+                }
             }
             _ => {}
         }

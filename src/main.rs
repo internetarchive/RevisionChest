@@ -61,6 +61,7 @@ fn main() -> io::Result<()> {
             if let Err(e) = process_file(&path, Some(output_dir), &args.namespace, &db_tx, file_index, total_files, skip_siteinfo) {
                 eprintln!("Error processing {:?}: {}", path, e);
             }
+            db_tx.send(DbMessage::Finalize).ok();
         });
     } else if let Some(input_path) = args.input {
         process_file(
@@ -72,11 +73,14 @@ fn main() -> io::Result<()> {
             1,
             skip_siteinfo,
         )?;
+        db_tx.send(DbMessage::Finalize).ok();
     } else {
         eprintln!("Usage: RevisionChest <wikipedia_dump.xml.bz2|7z> OR -d <input_dir> -o <output_dir>");
         std::process::exit(1);
     }
 
+    drop(db_tx.clone());
+    db_tx.send(DbMessage::Finalize).ok();
     drop(db_tx);
     db_thread.join().expect("Database thread panicked");
 

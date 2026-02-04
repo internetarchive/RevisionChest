@@ -94,6 +94,7 @@ pub fn process_file(
     let mut in_revision = false;
     let mut in_contributor = false;
     let mut in_siteinfo = false;
+    let mut page_sent = false;
 
     // Revision metadata
     let mut rev_id = String::new();
@@ -111,6 +112,7 @@ pub fn process_file(
                     "page" => {
                         in_page = true;
                         current_title.clear();
+                        page_sent = false;
                     }
                     "revision" => {
                         if let Some(allowed) = allowed_namespaces {
@@ -124,7 +126,7 @@ pub fn process_file(
                         }
 
                         if in_revision {
-                            if !current_page_id.is_empty() {
+                            if !page_sent && !current_page_id.is_empty() && !current_title.is_empty() {
                                 db_tx
                                     .send(DbMessage::Page {
                                         id: current_page_id.parse().unwrap_or(0),
@@ -132,6 +134,7 @@ pub fn process_file(
                                         title: current_title.clone(),
                                     })
                                     .ok();
+                                page_sent = true;
                             }
                             rev_id.clear();
                             parent_rev_id.clear();
@@ -150,6 +153,23 @@ pub fn process_file(
                 match name.as_str() {
                     "siteinfo" => in_siteinfo = false,
                     "page" => {
+                        if !page_sent && !current_page_id.is_empty() && !current_title.is_empty() {
+                            let should_send = if let Some(allowed) = allowed_namespaces {
+                                allowed.contains(&current_ns)
+                            } else {
+                                true
+                            };
+                            
+                            if should_send {
+                                db_tx
+                                    .send(DbMessage::Page {
+                                        id: current_page_id.parse().unwrap_or(0),
+                                        ns: current_ns.parse().unwrap_or(0),
+                                        title: current_title.clone(),
+                                    })
+                                    .ok();
+                            }
+                        }
                         in_page = false;
                         current_page_id.clear();
                         current_ns.clear();

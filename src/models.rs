@@ -17,4 +17,5 @@ pub enum DbMessage {
         offset_end: u64,
         timestamp: String,
     },
+    Finalize,
 }
