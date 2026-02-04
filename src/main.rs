@@ -207,17 +207,6 @@ fn process_pg_batch(
                     &[&domain_label, &domain_id],
                 )?;
 
-                tx.execute(
-                    "UPDATE web_resources wr
-                     SET instance_of_document = d.id
-                     FROM documents d
-                     JOIN temp_pages tp ON d.title = tp.title
-                     WHERE wr.numeric_page_id = tp.id
-                     AND wr.domain_id = $1
-                     AND wr.instance_of_document IS NULL",
-                    &[&domain_id],
-                )?;
-
                 Ok::<(), Box<dyn std::error::Error>>(())
             })();
 
