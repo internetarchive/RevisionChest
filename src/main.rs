@@ -78,7 +78,7 @@ fn process_pg_batch(
         for msg in &batch {
             match msg {
                 DbMessage::Page { id, ns, title } => {
-                    let row = format!("{}\t{}\t{}\n", id, ns, title);
+                    let row = format!("{}\t{}\t{}\n", *id as i32, ns, title);
                     page_data.extend_from_slice(row.as_bytes());
                 }
                 DbMessage::Revision {
@@ -108,7 +108,7 @@ fn process_pg_batch(
                                 id
                             }
                             Err(e) => {
-                                eprintln!("Error upserting bundle: {}. Retrying...", e);
+                                eprintln!("Error upserting bundle (file_path: {}): {:?}. Retrying...", file_path, e);
                                 success = false;
                                 break;
                             }
@@ -179,7 +179,7 @@ fn process_pg_batch(
             })();
 
             if let Err(e) = page_res {
-                eprintln!("COPY pages failed: {}. Retrying...", e);
+                eprintln!("COPY pages failed: {:?}. Retrying...", e);
                 retry_count += 1;
                 std::thread::sleep(std::time::Duration::from_millis(100 * retry_count));
                 continue;
@@ -195,7 +195,7 @@ fn process_pg_batch(
             })();
 
             if let Err(e) = copy_res {
-                eprintln!("COPY revisions failed: {}. Retrying...", e);
+                eprintln!("COPY revisions failed: {:?}. Retrying...", e);
                 retry_count += 1;
                 std::thread::sleep(std::time::Duration::from_millis(100 * retry_count));
                 continue;
@@ -207,7 +207,7 @@ fn process_pg_batch(
                 return;
             }
             Err(e) => {
-                eprintln!("Transaction commit failed: {}. Retrying...", e);
+                eprintln!("Transaction commit failed: {:?}. Retrying...", e);
                 retry_count += 1;
                 std::thread::sleep(std::time::Duration::from_millis(100 * retry_count));
             }
