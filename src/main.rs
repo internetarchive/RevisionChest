@@ -61,9 +61,21 @@ fn process_pg_batch(
             lock.clone().expect("Domain label should be cached by now")
         };
 
+        // Sort batch to avoid deadlocks in revision_bundles upserts
+        let mut sorted_batch = batch.clone();
+        sorted_batch.sort_by(|a, b| {
+            match (a, b) {
+                (DbMessage::Revision { file_path: f1, .. }, DbMessage::Revision { file_path: f2, .. }) => f1.cmp(f2),
+                (DbMessage::Page { .. }, DbMessage::Revision { .. }) => std::cmp::Ordering::Less,
+                (DbMessage::Revision { .. }, DbMessage::Page { .. }) => std::cmp::Ordering::Greater,
+                _ => std::cmp::Ordering::Equal,
+            }
+        });
+
         let mut rev_data = Vec::new();
         let mut page_data = Vec::new();
         let mut bundle_cache: HashMap<String, i32> = HashMap::new();
+        let mut seen_pages = std::collections::HashSet::new();
 
         tx.execute(
             "CREATE TEMP TABLE temp_pages (
@@ -75,11 +87,13 @@ fn process_pg_batch(
         ).expect("Failed to create temp_pages");
 
         let mut success = true;
-        for msg in &batch {
+        for msg in &sorted_batch {
             match msg {
                 DbMessage::Page { id, ns, title } => {
-                    let row = format!("{}\t{}\t{}\n", *id as i32, ns, title);
-                    page_data.extend_from_slice(row.as_bytes());
+                    if seen_pages.insert(*id) {
+                        let row = format!("{}\t{}\t{}\n", *id as i32, ns, title);
+                        page_data.extend_from_slice(row.as_bytes());
+                    }
                 }
                 DbMessage::Revision {
                     rev_id,
@@ -108,6 +122,14 @@ fn process_pg_batch(
                                 id
                             }
                             Err(e) => {
+                                if let Some(db_err) = e.as_db_error() {
+                                    if db_err.code() == &postgres::error::SqlState::T_R_SERIALIZATION_FAILURE || 
+                                       db_err.code() == &postgres::error::SqlState::T_R_DEADLOCK_DETECTED {
+                                        // Silent retry for concurrency issues
+                                        success = false;
+                                        break;
+                                    }
+                                }
                                 eprintln!("Error upserting bundle (file_path: {}): {:?}. Retrying...", file_path, e);
                                 success = false;
                                 break;
