@@ -40,7 +40,6 @@ enum DbMessage {
 fn process_pg_batch(
     pool: &r2d2::Pool<PostgresConnectionManager<NoTls>>,
     batch: Vec<DbMessage>,
-    domain_container_id_atomic: &Arc<std::sync::atomic::AtomicI32>,
     domain_id_atomic: &Arc<std::sync::atomic::AtomicI32>,
     domain_label_cached: &Arc<RwLock<Option<String>>>,
 ) {
@@ -51,10 +50,9 @@ fn process_pg_batch(
         let mut client = pool.get().expect("Failed to get connection from pool");
         let mut tx = client.transaction().expect("Failed to start transaction");
 
-        let container_id = domain_container_id_atomic.load(std::sync::atomic::Ordering::SeqCst);
         let domain_id = domain_id_atomic.load(std::sync::atomic::Ordering::SeqCst);
 
-        if container_id == 0 || domain_id == 0 {
+        if domain_id == 0 {
             return;
         }
 
@@ -147,10 +145,10 @@ fn process_pg_batch(
                 writer.finish()?;
 
                 tx.execute(
-                    "INSERT INTO documents (title, has_container)
-                     SELECT title, $1 FROM temp_pages
+                    "INSERT INTO documents (title)
+                     SELECT title FROM temp_pages
                      ON CONFLICT DO NOTHING",
-                    &[&container_id],
+                    &[],
                 )?;
 
                 tx.execute(
@@ -164,6 +162,17 @@ fn process_pg_batch(
                             domain_id = EXCLUDED.domain_id"
                     ),
                     &[&domain_label, &domain_id],
+                )?;
+
+                tx.execute(
+                    "UPDATE web_resources wr
+                     SET instance_of_document = d.id
+                     FROM documents d
+                     JOIN temp_pages tp ON d.title = tp.title
+                     WHERE wr.numeric_page_id = tp.id
+                     AND wr.domain_id = $1
+                     AND wr.instance_of_document IS NULL",
+                    &[&domain_id],
                 )?;
 
                 Ok::<(), Box<dyn std::error::Error>>(())
@@ -228,9 +237,7 @@ fn db_worker(rx: Receiver<DbMessage>, db_path: PathBuf) {
         {
             let mut client = pool.get().expect("Failed to get connection");
             let tables = [
-                "documents", "web_resources", "domains", "containers", "citations",
-                "citation_history", "revision_bundles", "revisions", "normalized_citations",
-                "normalized_citation_web_resources", "wiki_templates", "template_data"
+                "documents", "web_resources", "domains", "revision_bundles", "revisions"
             ];
             let rows = client
                 .query(
@@ -247,7 +254,6 @@ fn db_worker(rx: Receiver<DbMessage>, db_path: PathBuf) {
             }
         }
 
-        let domain_container_id = Arc::new(std::sync::atomic::AtomicI32::new(0));
         let domain_id = Arc::new(std::sync::atomic::AtomicI32::new(0));
         let domain_label_cached = Arc::new(RwLock::new(None));
 
@@ -258,13 +264,12 @@ fn db_worker(rx: Receiver<DbMessage>, db_path: PathBuf) {
         for _ in 0..4 {
             let (tx, sub_rx) = crossbeam_channel::bounded::<Vec<DbMessage>>(10);
             let pool_clone = pool.clone();
-            let container_id_clone = domain_container_id.clone();
             let domain_id_clone = domain_id.clone();
             let domain_label_clone = domain_label_cached.clone();
 
             let handle = thread::spawn(move || {
                 while let Ok(batch) = sub_rx.recv() {
-                    process_pg_batch(&pool_clone, batch, &container_id_clone, &domain_id_clone, &domain_label_clone);
+                    process_pg_batch(&pool_clone, batch, &domain_id_clone, &domain_label_clone);
                 }
             });
             sub_worker_txs.push(tx);
@@ -281,22 +286,10 @@ fn db_worker(rx: Receiver<DbMessage>, db_path: PathBuf) {
                     let mut tx = client.transaction().expect("Failed to start transaction");
 
                     tx.execute(
-                        "INSERT INTO containers (label) VALUES ($1) ON CONFLICT (label) DO NOTHING",
-                        &[&domain],
-                    ).expect("Failed to insert container");
-
-                    let container_id_val: i32 = tx.query_one(
-                        "SELECT id FROM containers WHERE label = $1",
-                        &[&domain],
-                    ).expect("Failed to fetch container id").get(0);
-
-                    domain_container_id.store(container_id_val, std::sync::atomic::Ordering::SeqCst);
-
-                    tx.execute(
-                        "INSERT INTO domains (value, for_container)
-                         VALUES ($1, $2)
+                        "INSERT INTO domains (value)
+                         VALUES ($1)
                          ON CONFLICT (value) DO NOTHING",
-                        &[&domain, &container_id_val],
+                        &[&domain],
                     ).expect("Failed to insert domain");
 
                     let domain_id_val: i32 = tx.query_one(
@@ -323,7 +316,7 @@ fn db_worker(rx: Receiver<DbMessage>, db_path: PathBuf) {
                     }
                 }
                 _ => {
-                    if domain_container_id.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                    if domain_id.load(std::sync::atomic::Ordering::SeqCst) == 0 {
                         if pending_messages.len() > 100_000 {
                             panic!("Too many pending messages without SiteInfo");
                         }
@@ -348,41 +341,7 @@ fn db_worker(rx: Receiver<DbMessage>, db_path: PathBuf) {
             handle.join().ok();
         }
         
-        // After workers are done, run the final update
-        {
-            println!("Ingestion finished. Linking web_resources to documents in chunks...");
-            let mut client = pool.get().expect("Failed to get connection for final update");
-            
-            loop {
-                let res = client.execute(
-                    "UPDATE web_resources wr
-                     SET instance_of_document = d.id
-                     FROM documents d
-                     WHERE wr.id IN (
-                        SELECT id FROM web_resources 
-                        WHERE instance_of_document IS NULL 
-                        LIMIT 10000
-                     )
-                     AND wr.numeric_page_id = CAST(substring(wr.url from 'curid=(\\d+)') AS INTEGER)
-                     AND d.has_container = wr.domain_id
-                     AND wr.instance_of_document IS NULL",
-                    &[],
-                );
-                match res {
-                    Ok(count) => {
-                        println!("Linked {} web_resources to documents", count);
-                        if count == 0 {
-                            break;
-                        }
-                    },
-                    Err(e) => {
-                        eprintln!("Failed to link web_resources: {}", e);
-                        break;
-                    },
-                }
-            }
-        }
-
+        // After workers are done, return
         return;
     }
 
