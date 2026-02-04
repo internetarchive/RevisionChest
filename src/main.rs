@@ -2,8 +2,7 @@ use bzip2::read::BzDecoder;
 use chrono::Local;
 use clap::Parser;
 use crossbeam_channel::{Receiver, Sender};
-use dashmap::DashMap;
-use postgres::{NoTls, Transaction};
+use postgres::{NoTls};
 use r2d2_postgres::PostgresConnectionManager;
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
@@ -14,42 +13,8 @@ use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use url::Url;
-
-struct ConceptCache {
-    labels: DashMap<String, i32>,
-}
-
-impl ConceptCache {
-    fn new() -> Self {
-        Self {
-            labels: DashMap::new(),
-        }
-    }
-
-    fn get_or_insert(&self, tx: &mut Transaction, label: &str) -> (i32, bool) {
-        if let Some(id) = self.labels.get(label) {
-            return (*id, false);
-        }
-
-        let row = tx.query_opt("SELECT id FROM concepts WHERE label = $1", &[&label]).expect("Query concepts failed");
-        
-        match row {
-            Some(row) => {
-                let id: i32 = row.get(0);
-                self.labels.insert(label.to_string(), id);
-                (id, false)
-            }
-            None => {
-                let id: i32 = tx.query_one("INSERT INTO concepts (label) VALUES ($1) RETURNING id", &[&label])
-                    .expect("Insert concepts failed")
-                    .get(0);
-                (id, true)
-            }
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 enum DbMessage {
@@ -75,9 +40,9 @@ enum DbMessage {
 fn process_pg_batch(
     pool: &r2d2::Pool<PostgresConnectionManager<NoTls>>,
     batch: Vec<DbMessage>,
-    cache: &Arc<ConceptCache>,
-    domain_container_concept_id: &Arc<std::sync::atomic::AtomicI32>,
-    domain_entity_concept_id: &Arc<std::sync::atomic::AtomicI32>,
+    domain_container_id_atomic: &Arc<std::sync::atomic::AtomicI32>,
+    domain_id_atomic: &Arc<std::sync::atomic::AtomicI32>,
+    domain_label_cached: &Arc<RwLock<Option<String>>>,
 ) {
     let mut retry_count = 0;
     let max_retries = 5;
@@ -86,71 +51,37 @@ fn process_pg_batch(
         let mut client = pool.get().expect("Failed to get connection from pool");
         let mut tx = client.transaction().expect("Failed to start transaction");
 
-        let container_id = domain_container_concept_id.load(std::sync::atomic::Ordering::SeqCst);
-        let entity_id = domain_entity_concept_id.load(std::sync::atomic::Ordering::SeqCst);
+        let container_id = domain_container_id_atomic.load(std::sync::atomic::Ordering::SeqCst);
+        let domain_id = domain_id_atomic.load(std::sync::atomic::Ordering::SeqCst);
 
-        if container_id == 0 || entity_id == 0 {
+        if container_id == 0 || domain_id == 0 {
             return;
         }
 
-        let domain_label = tx
-            .query_one("SELECT label FROM concepts WHERE id = $1", &[&container_id])
-            .expect("Failed to get domain label")
-            .get::<_, String>(0);
+        let domain_label = {
+            let lock = domain_label_cached.read().unwrap();
+            lock.clone().expect("Domain label should be cached by now")
+        };
 
         let mut rev_data = Vec::new();
-        let mut new_concepts = Vec::new();
+        let mut page_data = Vec::new();
+        let mut bundle_cache: HashMap<String, i32> = HashMap::new();
+
+        tx.execute(
+            "CREATE TEMP TABLE temp_pages (
+                id INTEGER,
+                ns INTEGER,
+                title TEXT
+            ) ON COMMIT DROP",
+            &[],
+        ).expect("Failed to create temp_pages");
 
         let mut success = true;
         for msg in &batch {
             match msg {
                 DbMessage::Page { id, ns, title } => {
-                    let page_label = format!("{}:{}", domain_label, id);
-                    let (concept_id, is_new) = cache.get_or_insert(&mut tx, &page_label);
-                    if is_new {
-                        new_concepts.push((page_label.clone(), concept_id));
-                    }
-
-                    if let Err(e) = tx.execute(
-                        "INSERT INTO documents (id, title, numeric_page_id, numeric_namespace_id, has_container)
-                         VALUES ($1, $2, $3, $4, $5)
-                         ON CONFLICT (numeric_page_id, has_container) DO NOTHING",
-                        &[&concept_id, &title, &(*id as i32), &ns, &container_id],
-                    ) {
-                        eprintln!("Error inserting document: {}. Retrying...", e);
-                        success = false;
-                        break;
-                    }
-
-                    let doc_concept_id: i32 = match tx.query_one(
-                            "SELECT id FROM documents WHERE numeric_page_id = $1 AND has_container = $2",
-                            &[&(*id as i32), &container_id],
-                        ) {
-                            Ok(row) => row.get(0),
-                            Err(e) => {
-                                eprintln!("Error fetching doc_concept_id: {}. Retrying...", e);
-                                success = false;
-                                break;
-                            }
-                        };
-
-                    let web_label = format!("{} (on web)", page_label);
-                    let (web_concept_id, is_new_web) = cache.get_or_insert(&mut tx, &web_label);
-                    if is_new_web {
-                        new_concepts.push((web_label, web_concept_id));
-                    }
-                    let web_url = format!("https://{}/w/index.php?curid={}", domain_label, id);
-
-                    if let Err(e) = tx.execute(
-                        "INSERT INTO web_resources (id, url, instance_of_document, domain, is_archive_of)
-                         VALUES ($1, $2, $3, $4, NULL)
-                         ON CONFLICT (url) DO NOTHING",
-                        &[&web_concept_id, &web_url, &doc_concept_id, &entity_id],
-                    ) {
-                        eprintln!("Error inserting web resource: {}. Retrying...", e);
-                        success = false;
-                        break;
-                    }
+                    let row = format!("{}\t{}\t{}\n", id, ns, title);
+                    page_data.extend_from_slice(row.as_bytes());
                 }
                 DbMessage::Revision {
                     rev_id,
@@ -161,20 +92,28 @@ fn process_pg_batch(
                     offset_end,
                     timestamp,
                 } => {
-                    let bundle_id_res = tx.query_one(
-                        "INSERT INTO revision_bundles (file_path)
-                         VALUES ($1)
-                         ON CONFLICT (file_path) DO UPDATE SET file_path = EXCLUDED.file_path
-                         RETURNING id",
-                        &[&file_path],
-                    );
-                    
-                    let bundle_id: i32 = match bundle_id_res {
-                        Ok(row) => row.get(0),
-                        Err(e) => {
-                            eprintln!("Error upserting bundle: {}. Retrying...", e);
-                            success = false;
-                            break;
+                    let bundle_id = if let Some(&id) = bundle_cache.get(file_path) {
+                        id
+                    } else {
+                        let bundle_id_res = tx.query_one(
+                            "INSERT INTO revision_bundles (file_path)
+                             VALUES ($1)
+                             ON CONFLICT (file_path) DO UPDATE SET file_path = EXCLUDED.file_path
+                             RETURNING id",
+                            &[file_path],
+                        );
+
+                        match bundle_id_res {
+                            Ok(row) => {
+                                let id: i32 = row.get(0);
+                                bundle_cache.insert(file_path.clone(), id);
+                                id
+                            }
+                            Err(e) => {
+                                eprintln!("Error upserting bundle: {}. Retrying...", e);
+                                success = false;
+                                break;
+                            }
                         }
                     };
 
@@ -201,6 +140,43 @@ fn process_pg_batch(
             continue;
         }
 
+        if !page_data.is_empty() {
+            let page_res = (|| {
+                let mut writer = tx.copy_in("COPY temp_pages (id, ns, title) FROM STDIN")?;
+                writer.write_all(&page_data)?;
+                writer.finish()?;
+
+                tx.execute(
+                    "INSERT INTO documents (title, has_container)
+                     SELECT title, $1 FROM temp_pages
+                     ON CONFLICT DO NOTHING",
+                    &[&container_id],
+                )?;
+
+                tx.execute(
+                    &format!(
+                        "INSERT INTO web_resources (url, numeric_page_id, numeric_namespace_id, domain_id, instance_of_document)
+                         SELECT 'https://' || $1 || '/w/index.php?curid=' || id, id, ns, $2, NULL
+                         FROM temp_pages
+                         ON CONFLICT (url) DO UPDATE SET
+                            numeric_page_id = EXCLUDED.numeric_page_id,
+                            numeric_namespace_id = EXCLUDED.numeric_namespace_id,
+                            domain_id = EXCLUDED.domain_id"
+                    ),
+                    &[&domain_label, &domain_id],
+                )?;
+
+                Ok::<(), Box<dyn std::error::Error>>(())
+            })();
+
+            if let Err(e) = page_res {
+                eprintln!("COPY pages failed: {}. Retrying...", e);
+                retry_count += 1;
+                std::thread::sleep(std::time::Duration::from_millis(100 * retry_count));
+                continue;
+            }
+        }
+
         if !rev_data.is_empty() {
             let copy_res = (|| {
                 let mut writer = tx.copy_in("COPY revisions (revision_id, page_id, found_in_bundle, offset_begin, offset_end, parent_revision_id, revision_timestamp) FROM STDIN")?;
@@ -219,9 +195,6 @@ fn process_pg_batch(
 
         match tx.commit() {
             Ok(_) => {
-                for (label, id) in new_concepts {
-                    cache.labels.insert(label, id);
-                }
                 return;
             }
             Err(e) => {
@@ -254,41 +227,48 @@ fn db_worker(rx: Receiver<DbMessage>, db_path: PathBuf) {
         // Verify tables
         {
             let mut client = pool.get().expect("Failed to get connection");
-            let tables = ["concepts", "documents", "revision_bundles", "revisions", "web_resources", "domains"];
+            let tables = [
+                "documents", "web_resources", "domains", "containers", "citations",
+                "citation_history", "revision_bundles", "revisions", "normalized_citations",
+                "normalized_citation_web_resources", "wiki_templates", "template_data"
+            ];
+            let rows = client
+                .query(
+                    "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_name = ANY($1)",
+                    &[&&tables[..]],
+                )
+                .expect("Failed to check for table existence");
+            
+            let existing_tables: Vec<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
             for table in &tables {
-                let row_exists: bool = client
-                    .query_one(
-                        "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_schema = 'public' AND table_name = $1)",
-                        &[table],
-                    )
-                    .expect("Failed to check for table existence")
-                    .get(0);
-                if !row_exists {
+                if !existing_tables.contains(&table.to_string()) {
                     panic!("Required table '{}' is missing", table);
                 }
             }
         }
 
-        let cache = Arc::new(ConceptCache::new());
-        let domain_container_concept_id = Arc::new(std::sync::atomic::AtomicI32::new(0));
-        let domain_entity_concept_id = Arc::new(std::sync::atomic::AtomicI32::new(0));
+        let domain_container_id = Arc::new(std::sync::atomic::AtomicI32::new(0));
+        let domain_id = Arc::new(std::sync::atomic::AtomicI32::new(0));
+        let domain_label_cached = Arc::new(RwLock::new(None));
 
         let mut pending_messages: Vec<DbMessage> = Vec::new();
         let mut sub_worker_txs: Vec<Sender<Vec<DbMessage>>> = Vec::new();
+        let mut sub_worker_handles = Vec::new();
 
         for _ in 0..4 {
             let (tx, sub_rx) = crossbeam_channel::bounded::<Vec<DbMessage>>(10);
             let pool_clone = pool.clone();
-            let cache_clone = cache.clone();
-            let container_id_clone = domain_container_concept_id.clone();
-            let entity_id_clone = domain_entity_concept_id.clone();
+            let container_id_clone = domain_container_id.clone();
+            let domain_id_clone = domain_id.clone();
+            let domain_label_clone = domain_label_cached.clone();
 
-            thread::spawn(move || {
+            let handle = thread::spawn(move || {
                 while let Ok(batch) = sub_rx.recv() {
-                    process_pg_batch(&pool_clone, batch, &cache_clone, &container_id_clone, &entity_id_clone);
+                    process_pg_batch(&pool_clone, batch, &container_id_clone, &domain_id_clone, &domain_label_clone);
                 }
             });
             sub_worker_txs.push(tx);
+            sub_worker_handles.push(handle);
         }
 
         let mut current_sub_worker = 0;
@@ -300,25 +280,38 @@ fn db_worker(rx: Receiver<DbMessage>, db_path: PathBuf) {
                     let mut client = pool.get().expect("Failed to get connection");
                     let mut tx = client.transaction().expect("Failed to start transaction");
 
-                    let (container_id, _) = cache.get_or_insert(&mut tx, &domain);
-                    domain_container_concept_id.store(container_id, std::sync::atomic::Ordering::SeqCst);
+                    tx.execute(
+                        "INSERT INTO containers (label) VALUES ($1) ON CONFLICT (label) DO NOTHING",
+                        &[&domain],
+                    ).expect("Failed to insert container");
 
-                    let entity_label = format!("{} (domain)", domain);
-                    let (entity_id, _) = cache.get_or_insert(&mut tx, &entity_label);
-                    domain_entity_concept_id.store(entity_id, std::sync::atomic::Ordering::SeqCst);
+                    let container_id_val: i32 = tx.query_one(
+                        "SELECT id FROM containers WHERE label = $1",
+                        &[&domain],
+                    ).expect("Failed to fetch container id").get(0);
+
+                    domain_container_id.store(container_id_val, std::sync::atomic::Ordering::SeqCst);
 
                     tx.execute(
-                        "INSERT INTO domains (id, value, top_level_domain, parent_domain, for_container)
-                         VALUES ($1, $2, $3, $4, $5)
+                        "INSERT INTO domains (value, for_container)
+                         VALUES ($1, $2)
                          ON CONFLICT (value) DO NOTHING",
-                        &[&entity_id, &domain, &Option::<String>::None, &Option::<i32>::None, &container_id],
-                    ).expect("Failed to upsert domain");
+                        &[&domain, &container_id_val],
+                    ).expect("Failed to insert domain");
+
+                    let domain_id_val: i32 = tx.query_one(
+                        "SELECT id FROM domains WHERE value = $1",
+                        &[&domain],
+                    ).expect("Failed to fetch domain id").get(0);
+
+                    domain_id.store(domain_id_val, std::sync::atomic::Ordering::SeqCst);
+
+                    {
+                        let mut lock = domain_label_cached.write().unwrap();
+                        *lock = Some(domain.clone());
+                    }
 
                     tx.commit().expect("Failed to commit siteinfo tx");
-                    
-                    // Update cache after commit
-                    cache.labels.insert(domain.clone(), container_id);
-                    cache.labels.insert(entity_label, entity_id);
 
                     // Process pending
                     let pending = std::mem::take(&mut pending_messages);
@@ -330,7 +323,7 @@ fn db_worker(rx: Receiver<DbMessage>, db_path: PathBuf) {
                     }
                 }
                 _ => {
-                    if domain_container_concept_id.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                    if domain_container_id.load(std::sync::atomic::Ordering::SeqCst) == 0 {
                         if pending_messages.len() > 100_000 {
                             panic!("Too many pending messages without SiteInfo");
                         }
@@ -348,7 +341,48 @@ fn db_worker(rx: Receiver<DbMessage>, db_path: PathBuf) {
         if !batch.is_empty() {
             sub_worker_txs[current_sub_worker].send(batch).ok();
         }
-        // Workers will exit when sub_worker_txs are dropped (at the end of db_worker)
+
+        // Wait for workers to finish
+        drop(sub_worker_txs);
+        for handle in sub_worker_handles {
+            handle.join().ok();
+        }
+        
+        // After workers are done, run the final update
+        {
+            println!("Ingestion finished. Linking web_resources to documents in chunks...");
+            let mut client = pool.get().expect("Failed to get connection for final update");
+            
+            loop {
+                let res = client.execute(
+                    "UPDATE web_resources wr
+                     SET instance_of_document = d.id
+                     FROM documents d
+                     WHERE wr.id IN (
+                        SELECT id FROM web_resources 
+                        WHERE instance_of_document IS NULL 
+                        LIMIT 10000
+                     )
+                     AND wr.numeric_page_id = CAST(substring(wr.url from 'curid=(\\d+)') AS INTEGER)
+                     AND d.has_container = wr.domain_id
+                     AND wr.instance_of_document IS NULL",
+                    &[],
+                );
+                match res {
+                    Ok(count) => {
+                        println!("Linked {} web_resources to documents", count);
+                        if count == 0 {
+                            break;
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("Failed to link web_resources: {}", e);
+                        break;
+                    },
+                }
+            }
+        }
+
         return;
     }
 
