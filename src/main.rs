@@ -37,6 +37,27 @@ enum DbMessage {
     },
 }
 
+fn sanitize_copy_text(s: &str) -> String {
+    let mut sanitized = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c == '\t' {
+            sanitized.push_str("\\t");
+        } else if c == '\n' {
+            sanitized.push_str("\\n");
+        } else if c == '\r' {
+            sanitized.push_str("\\r");
+        } else if c == '\\' {
+            sanitized.push_str("\\\\");
+        } else if c == '\0' {
+            // Null characters are not allowed in PostgreSQL text fields
+            continue;
+        } else {
+            sanitized.push(c);
+        }
+    }
+    sanitized
+}
+
 fn process_pg_batch(
     pool: &r2d2::Pool<PostgresConnectionManager<NoTls>>,
     batch: Vec<DbMessage>,
@@ -91,7 +112,7 @@ fn process_pg_batch(
             match msg {
                 DbMessage::Page { id, ns, title } => {
                     if seen_pages.insert(*id) {
-                        let row = format!("{}\t{}\t{}\n", *id as i32, ns, title);
+                        let row = format!("{}\t{}\t{}\n", *id as i32, ns, sanitize_copy_text(title));
                         page_data.extend_from_slice(row.as_bytes());
                     }
                 }
@@ -146,7 +167,7 @@ fn process_pg_batch(
                         *offset_begin as i32,
                         *offset_end as i32,
                         parent_id.map(|id| id.to_string()).unwrap_or_else(|| "\\N".to_string()),
-                        timestamp
+                        sanitize_copy_text(timestamp)
                     );
                     rev_data.extend_from_slice(row.as_bytes());
                 }
@@ -673,7 +694,8 @@ fn process_file(
                 current_tag.clear();
             }
             Ok(Event::Text(ref e)) => {
-                let content = e.unescape().unwrap_or_default().into_owned();
+                let content = String::from_utf8_lossy(e.as_ref()).into_owned();
+                let content = quick_xml::escape::unescape(&content).unwrap_or(std::borrow::Cow::Owned(content.clone())).into_owned();
                 match current_tag.as_str() {
                     "base" => {
                         if in_siteinfo && !skip_siteinfo {
