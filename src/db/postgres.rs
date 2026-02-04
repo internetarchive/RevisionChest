@@ -46,6 +46,7 @@ pub fn process_pg_batch(
         let mut rev_data = Vec::new();
         let mut page_data = Vec::new();
         let mut seen_pages = std::collections::HashSet::new();
+        let mut local_bundle_updates = Vec::new();
 
         tx.execute(
             "CREATE TEMP TABLE temp_pages (
@@ -85,6 +86,8 @@ pub fn process_pg_batch(
 
                     let bundle_id = if let Some(id) = cached_id {
                         id
+                    } else if let Some((_, id)) = local_bundle_updates.iter().find(|(p, _)| p == file_path) {
+                        *id
                     } else {
                         let bundle_id_res = tx.query_one(
                             "INSERT INTO revision_bundles (file_path)
@@ -97,10 +100,7 @@ pub fn process_pg_batch(
                         match bundle_id_res {
                             Ok(row) => {
                                 let id: i32 = row.get(0);
-                                {
-                                    let mut lock = bundle_cache.write().unwrap();
-                                    lock.insert(file_path.clone(), id);
-                                }
+                                local_bundle_updates.push((file_path.clone(), id));
                                 id
                             }
                             Err(e) => {
@@ -250,6 +250,13 @@ pub fn process_pg_batch(
 
         match tx.commit() {
             Ok(_) => {
+                // Now that the transaction is committed, it's safe to update the shared cache.
+                if !local_bundle_updates.is_empty() {
+                    let mut lock = bundle_cache.write().unwrap();
+                    for (path, id) in local_bundle_updates {
+                        lock.insert(path, id);
+                    }
+                }
                 return;
             }
             Err(e) => {
