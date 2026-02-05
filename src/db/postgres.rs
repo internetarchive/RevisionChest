@@ -37,6 +37,7 @@ pub fn process_pg_batch(
         sorted_batch.sort_by(|a, b| {
             match (a, b) {
                 (DbMessage::Revision { file_path: f1, .. }, DbMessage::Revision { file_path: f2, .. }) => f1.cmp(f2),
+                (DbMessage::Page { id: i1, .. }, DbMessage::Page { id: i2, .. }) => i1.cmp(i2),
                 (DbMessage::Page { .. }, DbMessage::Revision { .. }) => std::cmp::Ordering::Less,
                 (DbMessage::Revision { .. }, DbMessage::Page { .. }) => std::cmp::Ordering::Greater,
                 _ => std::cmp::Ordering::Equal,
@@ -89,13 +90,26 @@ pub fn process_pg_batch(
                     } else if let Some((_, id)) = local_bundle_updates.iter().find(|(p, _)| p == file_path) {
                         *id
                     } else {
-                        let bundle_id_res = tx.query_one(
-                            "INSERT INTO revision_bundles (file_path)
-                             VALUES ($1)
-                             ON CONFLICT (file_path) DO UPDATE SET file_path = EXCLUDED.file_path
-                             RETURNING id",
+                        // First, try to see if it exists WITHOUT an UPSERT to avoid locks if it's already there
+                        // but just wasn't in our local/global cache yet (other worker might have added it)
+                        let existing = tx.query_opt(
+                            "SELECT id FROM revision_bundles WHERE file_path = $1",
                             &[file_path],
                         );
+
+                        let bundle_id_res = match existing {
+                            Ok(Some(row)) => Ok(row),
+                            _ => {
+                                // Not found, try to insert
+                                tx.query_one(
+                                    "INSERT INTO revision_bundles (file_path)
+                                     VALUES ($1)
+                                     ON CONFLICT (file_path) DO UPDATE SET file_path = EXCLUDED.file_path
+                                     RETURNING id",
+                                    &[file_path],
+                                )
+                            }
+                        };
 
                         match bundle_id_res {
                             Ok(row) => {
@@ -107,7 +121,6 @@ pub fn process_pg_batch(
                                 if let Some(db_err) = e.as_db_error() {
                                     if db_err.code() == &postgres::error::SqlState::T_R_SERIALIZATION_FAILURE || 
                                        db_err.code() == &postgres::error::SqlState::T_R_DEADLOCK_DETECTED {
-                                        // Silent retry for concurrency issues
                                         success = false;
                                         break;
                                     }
@@ -225,7 +238,24 @@ pub fn process_pg_batch(
             })();
 
             if let Err(e) = page_res {
-                eprintln!("COPY pages failed: {:?}. Retrying...", e);
+                if let Some(db_err) = e.downcast_ref::<::postgres::Error>().and_then(|de| de.as_db_error()) {
+                    if db_err.code() == &::postgres::error::SqlState::T_R_SERIALIZATION_FAILURE || 
+                       db_err.code() == &::postgres::error::SqlState::T_R_DEADLOCK_DETECTED {
+                        eprintln!("Deadlock during COPY pages: {}. Retrying...", db_err.message());
+                        success = false;
+                    } else {
+                        eprintln!("COPY pages failed: {:?}. Retrying...", e);
+                    }
+                } else {
+                    eprintln!("COPY pages failed: {:?}. Retrying...", e);
+                }
+
+                if !success {
+                    retry_count += 1;
+                    thread::sleep(std::time::Duration::from_millis(100 * retry_count));
+                    continue;
+                }
+
                 retry_count += 1;
                 thread::sleep(std::time::Duration::from_millis(100 * retry_count));
                 continue;
@@ -234,6 +264,9 @@ pub fn process_pg_batch(
 
         if !rev_data.is_empty() {
             let copy_res = (|| {
+                // Ensure foreign key constraints don't cause deadlocks by using a predictable order
+                // The main batch is already sorted by file_path, and revisions within a batch 
+                // generally refer to the same or few bundles.
                 let mut writer = tx.copy_in("COPY revisions (revision_id, page_id, found_in_bundle, offset_begin, offset_end, parent_revision_id, revision_timestamp) FROM STDIN")?;
                 writer.write_all(&rev_data)?;
                 writer.finish()?;
@@ -241,11 +274,35 @@ pub fn process_pg_batch(
             })();
 
             if let Err(e) = copy_res {
-                eprintln!("COPY revisions failed: {:?}. Retrying...", e);
+                if let Some(db_err) = e.downcast_ref::<::postgres::Error>().and_then(|de| de.as_db_error()) {
+                    if db_err.code() == &::postgres::error::SqlState::T_R_SERIALIZATION_FAILURE || 
+                       db_err.code() == &::postgres::error::SqlState::T_R_DEADLOCK_DETECTED {
+                        eprintln!("Deadlock during COPY revisions: {}. Retrying...", db_err.message());
+                        success = false;
+                        // No break here, we're already at the end of the loop, but we need to signal failure
+                    } else {
+                        eprintln!("COPY revisions failed: {:?}. Retrying...", e);
+                    }
+                } else {
+                    eprintln!("COPY revisions failed: {:?}. Retrying...", e);
+                }
+                
+                if !success {
+                    retry_count += 1;
+                    thread::sleep(std::time::Duration::from_millis(100 * retry_count));
+                    continue;
+                }
+
                 retry_count += 1;
                 thread::sleep(std::time::Duration::from_millis(100 * retry_count));
                 continue;
             }
+        }
+
+        if !success {
+            retry_count += 1;
+            thread::sleep(std::time::Duration::from_millis(100 * retry_count));
+            continue;
         }
 
         match tx.commit() {
