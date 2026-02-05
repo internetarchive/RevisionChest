@@ -58,7 +58,20 @@ pub fn process_pg_batch(
             &[],
         ).expect("Failed to create temp_pages");
 
-        tx.execute("TRUNCATE temp_pages", &[]).expect("Failed to truncate temp_pages");
+        tx.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS temp_revisions (
+                revision_id BIGINT,
+                page_id BIGINT,
+                found_in_bundle INTEGER,
+                offset_begin BIGINT,
+                offset_end BIGINT,
+                parent_revision_id BIGINT,
+                revision_timestamp TEXT
+            ) ON COMMIT DROP",
+            &[],
+        ).expect("Failed to create temp_revisions");
+
+        tx.execute("TRUNCATE temp_pages, temp_revisions", &[]).expect("Failed to truncate temp tables");
 
         let mut success = true;
         for msg in &sorted_batch {
@@ -287,12 +300,18 @@ pub fn process_pg_batch(
 
         if !rev_data.is_empty() {
             let copy_res = (|| {
-                // Ensure foreign key constraints don't cause deadlocks by using a predictable order
-                // The main batch is already sorted by file_path, and revisions within a batch 
-                // generally refer to the same or few bundles.
-                let mut writer = tx.copy_in("COPY revisions (revision_id, page_id, found_in_bundle, offset_begin, offset_end, parent_revision_id, revision_timestamp) FROM STDIN")?;
+                let mut writer = tx.copy_in("COPY temp_revisions (revision_id, page_id, found_in_bundle, offset_begin, offset_end, parent_revision_id, revision_timestamp) FROM STDIN")?;
                 writer.write_all(&rev_data)?;
                 writer.finish()?;
+
+                tx.execute(
+                    "INSERT INTO revisions (revision_id, page_id, found_in_bundle, offset_begin, offset_end, parent_revision_id, revision_timestamp)
+                     SELECT revision_id, page_id, found_in_bundle, offset_begin, offset_end, parent_revision_id, revision_timestamp
+                     FROM temp_revisions
+                     ON CONFLICT (revision_id) DO NOTHING",
+                    &[],
+                )?;
+
                 Ok::<(), Box<dyn std::error::Error>>(())
             })();
 
