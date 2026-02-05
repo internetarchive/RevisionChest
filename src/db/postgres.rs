@@ -50,13 +50,15 @@ pub fn process_pg_batch(
         let mut local_bundle_updates = Vec::new();
 
         tx.execute(
-            "CREATE TEMP TABLE temp_pages (
+            "CREATE TEMP TABLE IF NOT EXISTS temp_pages (
                 id INTEGER,
                 ns INTEGER,
                 title TEXT
             ) ON COMMIT DROP",
             &[],
         ).expect("Failed to create temp_pages");
+
+        tx.execute("TRUNCATE temp_pages", &[]).expect("Failed to truncate temp_pages");
 
         let mut success = true;
         for msg in &sorted_batch {
@@ -121,6 +123,7 @@ pub fn process_pg_batch(
                                 if let Some(db_err) = e.as_db_error() {
                                     if db_err.code() == &postgres::error::SqlState::T_R_SERIALIZATION_FAILURE || 
                                        db_err.code() == &postgres::error::SqlState::T_R_DEADLOCK_DETECTED {
+                                        eprintln!("Deadlock during bundle upsert: {}. Retrying...", db_err.message());
                                         success = false;
                                         break;
                                     }
@@ -160,12 +163,14 @@ pub fn process_pg_batch(
 
                         let finalize_res = (|| {
                             tx.execute(
-                                "CREATE TEMP TABLE temp_finalize_pages (
+                                "CREATE TEMP TABLE IF NOT EXISTS temp_finalize_pages (
                                     id INTEGER,
                                     title TEXT
                                 ) ON COMMIT DROP",
                                 &[],
                             )?;
+
+                            tx.execute("TRUNCATE temp_finalize_pages", &[])?;
 
                             let mut writer = tx.copy_in("COPY temp_finalize_pages (id, title) FROM STDIN")?;
                             writer.write_all(&finalize_page_data)?;
@@ -192,7 +197,25 @@ pub fn process_pg_batch(
                         })();
 
                         if let Err(e) = finalize_res {
+                            if let Some(db_err) = e.downcast_ref::<::postgres::Error>().and_then(|de| de.as_db_error()) {
+                                if db_err.code() == &::postgres::error::SqlState::T_R_SERIALIZATION_FAILURE || 
+                                   db_err.code() == &::postgres::error::SqlState::T_R_DEADLOCK_DETECTED {
+                                    eprintln!("Deadlock during Finalize pages: {}. Retrying...", db_err.message());
+                                    // Restore the cache
+                                    let mut lock = page_title_cache.write().unwrap();
+                                    for (id, title) in cached {
+                                        lock.entry(id).or_insert(title);
+                                    }
+                                    success = false;
+                                    break;
+                                }
+                            }
                             eprintln!("Finalize pages failed: {:?}. Retrying...", e);
+                            // Restore the cache
+                            let mut lock = page_title_cache.write().unwrap();
+                            for (id, title) in cached {
+                                lock.entry(id).or_insert(title);
+                            }
                             success = false;
                             break;
                         }
