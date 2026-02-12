@@ -4,7 +4,7 @@ use clap::Parser;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 pub struct Args {
-    /// Wikipedia dump file (.bz2 or .7z)
+    /// Wikipedia dump file (.bz2, .7z or .xml)
     pub input: Option<PathBuf>,
 
     /// Directory containing Wikipedia dump files
@@ -26,4 +26,8 @@ pub struct Args {
     /// Override or specify the wiki domain (e.g., en.wikipedia.org)
     #[arg(long)]
     pub domain: Option<String>,
+
+    /// Do not create or update the database
+    #[arg(long)]
+    pub no_db: bool,
 }

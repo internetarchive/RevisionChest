@@ -41,9 +41,12 @@ pub fn process_file(
         }).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         
         Box::new(io::Cursor::new(first_file_content))
-    } else {
+    } else if input_path.extension().map_or(false, |ext| ext == "bz2") {
         let file = File::open(input_path)?;
         Box::new(BzDecoder::new(file))
+    } else {
+        let file = File::open(input_path)?;
+        Box::new(file)
     };
 
     let writer: Box<dyn Write> = if let Some(out_dir) = output_dir {
@@ -53,6 +56,8 @@ pub fn process_file(
             out_name = out_name.strip_suffix(".bz2").unwrap().to_string();
         } else if out_name.ends_with(".7z") {
             out_name = out_name.strip_suffix(".7z").unwrap().to_string();
+        } else if out_name.ends_with(".xml") {
+            out_name = out_name.strip_suffix(".xml").unwrap().to_string();
         }
         out_name.push_str(".mwrev.zst");
         let out_path = out_dir.join(out_name);

@@ -27,8 +27,13 @@ fn main() -> io::Result<()> {
         }
     }
 
+    let no_db = args.no_db;
     let db_thread = thread::spawn(move || {
-        db_worker(db_rx, db_path);
+        if no_db {
+            while let Ok(_) = db_rx.recv() {}
+        } else {
+            db_worker(db_rx, db_path);
+        }
     });
 
     let skip_siteinfo = if let Some(domain) = args.domain.clone() {
@@ -47,7 +52,11 @@ fn main() -> io::Result<()> {
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.path())
             .filter(|path| {
-                path.is_file() && (path.extension() == Some("bz2".as_ref()) || path.extension() == Some("7z".as_ref()))
+                path.is_file() && (
+                    path.extension() == Some("bz2".as_ref()) || 
+                    path.extension() == Some("7z".as_ref()) ||
+                    path.extension() == Some("xml".as_ref())
+                )
             })
             .collect();
 
@@ -75,7 +84,7 @@ fn main() -> io::Result<()> {
         )?;
         db_tx.send(DbMessage::Finalize).ok();
     } else {
-        eprintln!("Usage: RevisionChest <wikipedia_dump.xml.bz2|7z> OR -d <input_dir> -o <output_dir>");
+        eprintln!("Usage: RevisionChest <wikipedia_dump.xml.bz2|7z|xml> OR -d <input_dir> -o <output_dir>");
         std::process::exit(1);
     }
 
