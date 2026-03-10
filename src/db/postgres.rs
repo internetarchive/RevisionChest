@@ -64,7 +64,7 @@ pub fn process_pg_batch(
                 page_id BIGINT,
                 found_in_bundle INTEGER,
                 offset_begin BIGINT,
-                offset_end BIGINT,
+                length BIGINT,
                 parent_revision_id BIGINT,
                 revision_timestamp TEXT
             ) ON COMMIT DROP",
@@ -92,7 +92,7 @@ pub fn process_pg_batch(
                     page_id,
                     file_path,
                     offset_begin,
-                    offset_end,
+                    length,
                     timestamp,
                 } => {
                     let cached_id = {
@@ -155,7 +155,7 @@ pub fn process_pg_batch(
                         *page_id as i32,
                         bundle_id,
                         *offset_begin as i32,
-                        *offset_end as i32,
+                        *length as i32,
                         parent_id.map(|id| id.to_string()).unwrap_or_else(|| "\\N".to_string()),
                         sanitize_copy_text(timestamp)
                     );
@@ -300,13 +300,13 @@ pub fn process_pg_batch(
 
         if !rev_data.is_empty() {
             let copy_res = (|| {
-                let mut writer = tx.copy_in("COPY temp_revisions (revision_id, page_id, found_in_bundle, offset_begin, offset_end, parent_revision_id, revision_timestamp) FROM STDIN")?;
+                let mut writer = tx.copy_in("COPY temp_revisions (revision_id, page_id, found_in_bundle, offset_begin, length, parent_revision_id, revision_timestamp) FROM STDIN")?;
                 writer.write_all(&rev_data)?;
                 writer.finish()?;
 
                 tx.execute(
-                    "INSERT INTO revisions (revision_id, page_id, found_in_bundle, offset_begin, offset_end, parent_revision_id, revision_timestamp)
-                     SELECT revision_id, page_id, found_in_bundle, offset_begin, offset_end, parent_revision_id, revision_timestamp
+                    "INSERT INTO revisions (revision_id, page_id, found_in_bundle, offset_begin, length, parent_revision_id, revision_timestamp)
+                     SELECT revision_id, page_id, found_in_bundle, offset_begin, length, parent_revision_id, revision_timestamp
                      FROM temp_revisions
                      ON CONFLICT (revision_id) DO NOTHING",
                     &[],

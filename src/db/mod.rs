@@ -178,7 +178,7 @@ pub fn db_worker(rx: Receiver<DbMessage>, db_path: PathBuf) {
              page_id INTEGER,
              found_in_bundle INTEGER,
              offset_begin INTEGER,
-             offset_end INTEGER,
+             length INTEGER,
              parent_revision_id INTEGER,
              revision_timestamp TEXT,
              FOREIGN KEY(found_in_bundle) REFERENCES revision_bundles(id)
