@@ -35,7 +35,7 @@ pub fn process_sqlite_batch(
                 page_id,
                 file_path,
                 offset_begin,
-                offset_end,
+                length,
                 timestamp,
             } => {
                 let b_id = if let Some(&id) = bundle_cache.get(&file_path) {
@@ -55,9 +55,9 @@ pub fn process_sqlite_batch(
                 };
 
                 tx.execute(
-                    "INSERT OR IGNORE INTO revisions (revision_id, page_id, found_in_bundle, offset_begin, offset_end, parent_revision_id, revision_timestamp)
+                    "INSERT OR IGNORE INTO revisions (revision_id, page_id, found_in_bundle, offset_begin, length, parent_revision_id, revision_timestamp)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    params![rev_id as i64, page_id as i64, b_id, offset_begin as i64, offset_end as i64, parent_rev_id.map(|id| id as i64), timestamp],
+                    params![rev_id as i64, page_id as i64, b_id, offset_begin as i64, length as i64, parent_rev_id.map(|id| id as i64), timestamp],
                 ).ok();
             }
             DbMessage::Finalize => {

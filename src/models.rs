@@ -14,7 +14,7 @@ pub enum DbMessage {
         page_id: u64,
         file_path: String,
         offset_begin: u64,
-        offset_end: u64,
+        length: u64,
         timestamp: String,
     },
     Finalize,

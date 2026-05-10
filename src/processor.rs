@@ -195,7 +195,7 @@ pub fn process_file(
                             for line in text.lines() {
                                 writeln!(writer, " {}", line)?;
                             }
-                            let offset_end = writer.offset;
+                            let length = writer.offset - offset_begin;
 
                             let out_name = if output_dir.is_some() {
                                 let mut out_name = filename.to_string();
@@ -216,7 +216,7 @@ pub fn process_file(
                                 page_id: current_page_id.parse().unwrap_or(0),
                                 file_path: out_name,
                                 offset_begin,
-                                offset_end,
+                                length,
                                 timestamp: timestamp.clone(),
                             }).ok();
 
