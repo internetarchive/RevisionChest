@@ -2,6 +2,7 @@
 pub enum DbMessage {
     SiteInfo {
         domain: String,
+        language_code: Option<String>,
     },
     Page {
         id: u64,

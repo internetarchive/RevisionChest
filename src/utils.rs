@@ -18,3 +18,8 @@ pub fn sanitize_copy_text(s: &str) -> String {
     }
     sanitized
 }
+
+pub fn compute_url_hash(url: &str) -> String {
+    let digest = md5::compute(url);
+    format!("{:x}", digest)
+}
