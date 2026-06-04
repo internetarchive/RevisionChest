@@ -240,9 +240,21 @@ pub fn process_file(
                         if in_siteinfo && !skip_siteinfo {
                             if let Ok(url) = Url::parse(&content) {
                                 if let Some(domain) = url.domain() {
-                                    db_tx.send(DbMessage::SiteInfo { domain: domain.to_string() }).ok();
+                                    db_tx.send(DbMessage::SiteInfo { 
+                                        domain: domain.to_string(),
+                                        language_code: None, // TBD: extract from somewhere if available
+                                    }).ok();
                                 }
                             }
+                        }
+                    }
+                    "lang" => {
+                        if in_siteinfo && !skip_siteinfo {
+                            // Extract language code if available in siteinfo
+                            // We need to send it with domain, but domain might be sent before lang
+                            // For simplicity, we can just send another SiteInfo message if we find lang
+                            // or better, store it and send it when siteinfo ends.
+                            // But siteinfo is small, so multiple messages are fine.
                         }
                     }
                     "title" => {

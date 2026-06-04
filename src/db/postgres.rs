@@ -4,13 +4,14 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 use r2d2_postgres::PostgresConnectionManager;
 use crate::models::DbMessage;
-use crate::utils::sanitize_copy_text;
+use crate::utils::{sanitize_copy_text, compute_url_hash};
 
 pub fn process_pg_batch(
     pool: &r2d2::Pool<PostgresConnectionManager<postgres::NoTls>>,
     batch: Vec<DbMessage>,
     domain_id_atomic: &Arc<std::sync::atomic::AtomicI32>,
     domain_label_cached: &Arc<RwLock<Option<String>>>,
+    language_code_cached: &Arc<RwLock<Option<String>>>,
     bundle_cache: &Arc<RwLock<HashMap<String, i32>>>,
     page_title_cache: &Arc<RwLock<HashMap<u64, String>>>,
 ) {
@@ -30,6 +31,11 @@ pub fn process_pg_batch(
         let domain_label = {
             let lock = domain_label_cached.read().unwrap();
             lock.clone().expect("Domain label should be cached by now")
+        };
+
+        let language_code = {
+            let lock = language_code_cached.read().unwrap();
+            lock.clone()
         };
 
         // Sort batch to avoid deadlocks in revision_bundles upserts
@@ -53,7 +59,10 @@ pub fn process_pg_batch(
             "CREATE TEMP TABLE IF NOT EXISTS temp_pages (
                 id INTEGER,
                 ns INTEGER,
-                title TEXT
+                title TEXT,
+                url TEXT,
+                url_hash CHAR(32),
+                language_code TEXT
             ) ON COMMIT DROP",
             &[],
         ).expect("Failed to create temp_pages");
@@ -78,7 +87,10 @@ pub fn process_pg_batch(
             match msg {
                 DbMessage::Page { id, ns, title } => {
                     if seen_pages.insert(*id) {
-                        let row = format!("{}\t{}\t{}\n", *id as i32, ns, sanitize_copy_text(title));
+                        let url = format!("https://{}/w/index.php?curid={}", domain_label, id);
+                        let url_hash = compute_url_hash(&url);
+                        let lang = language_code.as_deref().unwrap_or("");
+                        let row = format!("{}\t{}\t{}\t{}\t{}\t{}\n", *id as i32, ns, sanitize_copy_text(title), url, url_hash, lang);
                         page_data.extend_from_slice(row.as_bytes());
                     }
                     {
@@ -246,28 +258,28 @@ pub fn process_pg_batch(
 
         if !page_data.is_empty() {
             let page_res = (|| {
-                let mut writer = tx.copy_in("COPY temp_pages (id, ns, title) FROM STDIN")?;
+                let mut writer = tx.copy_in("COPY temp_pages (id, ns, title, url, url_hash, language_code) FROM STDIN")?;
                 writer.write_all(&page_data)?;
                 writer.finish()?;
 
                 tx.execute(
-                    "INSERT INTO documents (title)
-                     SELECT title FROM temp_pages
+                    "INSERT INTO documents (title, language_code)
+                     SELECT title, language_code FROM temp_pages
                      ON CONFLICT DO NOTHING",
                     &[],
                 )?;
 
                 tx.execute(
-                    &format!(
-                        "INSERT INTO web_resources (url, numeric_page_id, numeric_namespace_id, domain_id, instance_of_document)
-                         SELECT 'https://' || $1 || '/w/index.php?curid=' || tp.id, tp.id, tp.ns, $2, NULL
-                         FROM temp_pages tp
-                         ON CONFLICT (url) DO UPDATE SET
-                            numeric_page_id = EXCLUDED.numeric_page_id,
-                            numeric_namespace_id = EXCLUDED.numeric_namespace_id,
-                            domain_id = EXCLUDED.domain_id"
-                    ),
-                    &[&domain_label, &domain_id],
+                    "INSERT INTO web_resources (url, url_hash, numeric_page_id, numeric_namespace_id, domain_id, instance_of_document)
+                     SELECT url, url_hash, id, ns, $1, (SELECT id FROM documents d WHERE d.title = temp_pages.title LIMIT 1)
+                     FROM temp_pages
+                     ON CONFLICT (url_hash) DO UPDATE SET
+                        url = EXCLUDED.url,
+                        numeric_page_id = EXCLUDED.numeric_page_id,
+                        numeric_namespace_id = EXCLUDED.numeric_namespace_id,
+                        domain_id = EXCLUDED.domain_id,
+                        instance_of_document = EXCLUDED.instance_of_document",
+                    &[&domain_id],
                 )?;
 
                 Ok::<(), Box<dyn std::error::Error>>(())

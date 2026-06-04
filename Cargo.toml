@@ -18,5 +18,8 @@ dotenvy = "0.15"
 postgres = "0.19"
 r2d2 = "0.8"
 r2d2_postgres = "0.18"
-dashmap = "6.1"
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+serde_json = "1.0"
 url = "2.5"
+moka = { version = "0.12", features = ["sync"] }
+md5 = "0.7"

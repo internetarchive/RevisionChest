@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use rusqlite::{params, Connection};
 use crate::models::DbMessage;
+use crate::utils::compute_url_hash;
 
 pub fn process_sqlite_batch(
     conn: &Connection,
@@ -9,6 +10,7 @@ pub fn process_sqlite_batch(
     page_title_cache: &mut HashMap<u64, String>,
     domain_id: Option<i64>,
     domain_label: Option<&str>,
+    language_code: Option<&str>,
 ) {
     let tx = conn.unchecked_transaction().expect("Failed to start SQLite transaction");
 
@@ -17,14 +19,16 @@ pub fn process_sqlite_batch(
             DbMessage::Page { id, ns, title } => {
                 if let (Some(did), Some(dlabel)) = (domain_id, domain_label) {
                     let url = format!("https://{}/w/index.php?curid={}", dlabel, id);
+                    let url_hash = compute_url_hash(&url);
                     tx.execute(
-                        "INSERT INTO web_resources (url, numeric_page_id, numeric_namespace_id, domain_id, instance_of_document)
-                         VALUES (?1, ?2, ?3, ?4, NULL)
-                         ON CONFLICT (url) DO UPDATE SET
+                        "INSERT INTO web_resources (url, url_hash, numeric_page_id, numeric_namespace_id, domain_id, instance_of_document)
+                         VALUES (?1, ?2, ?3, ?4, ?5, NULL)
+                         ON CONFLICT (url_hash) DO UPDATE SET
+                            url = EXCLUDED.url,
                             numeric_page_id = EXCLUDED.numeric_page_id,
                             numeric_namespace_id = EXCLUDED.numeric_namespace_id,
                             domain_id = EXCLUDED.domain_id",
-                        params![url, id as i64, ns, did],
+                        params![url, url_hash, id as i64, ns, did],
                     ).ok();
                 }
                 page_title_cache.insert(id, title);
@@ -63,8 +67,8 @@ pub fn process_sqlite_batch(
             DbMessage::Finalize => {
                 for (page_id, title) in page_title_cache.drain() {
                     tx.execute(
-                        "INSERT OR IGNORE INTO documents (title) VALUES (?1)",
-                        params![title],
+                        "INSERT OR IGNORE INTO documents (title, language_code) VALUES (?1, ?2)",
+                        params![title, language_code],
                     ).ok();
                     tx.execute(
                         "UPDATE web_resources 
