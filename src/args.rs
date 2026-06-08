@@ -41,6 +41,10 @@ pub struct SyncArgs {
     /// Interval in minutes for ongoing sync (default: 10)
     #[arg(long)]
     pub interval: Option<u64>,
+
+    /// Number of concurrent jobs (default: number of logical CPUs)
+    #[arg(short = 'j', long)]
+    pub jobs: Option<usize>,
 }
 
 #[derive(Parser, Debug)]
@@ -71,4 +75,12 @@ pub struct BuildArgs {
     /// Do not create or update the database
     #[arg(long)]
     pub no_db: bool,
+
+    /// Output metadata to a Parquet file. Use with --no-db if you want to skip database ingestion entirely.
+    #[arg(long)]
+    pub parquet: Option<PathBuf>,
+
+    /// Number of concurrent jobs (default: number of logical CPUs)
+    #[arg(short = 'j', long)]
+    pub jobs: Option<usize>,
 }

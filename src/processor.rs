@@ -17,7 +17,8 @@ pub fn process_file(
     file_index: usize,
     total_files: usize,
     skip_siteinfo: bool,
-) -> io::Result<()> {
+) -> io::Result<Vec<DbMessage>> {
+    let mut messages = Vec::new();
     let filename = input_path.file_name().unwrap().to_string_lossy();
     eprintln!(
         "[{}] Starting {} ({}/{})",
@@ -130,15 +131,15 @@ pub fn process_file(
                             in_revision = true;
                         }
 
-                        if in_revision {
+                if in_revision {
                             if !page_sent && !current_page_id.is_empty() && !current_title.is_empty() {
-                                db_tx
-                                    .send(DbMessage::Page {
+                                let msg = DbMessage::Page {
                                         id: current_page_id.parse().unwrap_or(0),
                                         ns: current_ns.parse().unwrap_or(0),
                                         title: current_title.clone(),
-                                    })
-                                    .ok();
+                                    };
+                                db_tx.send(msg.clone()).ok();
+                                messages.push(msg);
                                 page_sent = true;
                             }
                             rev_id.clear();
@@ -166,13 +167,13 @@ pub fn process_file(
                             };
                             
                             if should_send {
-                                db_tx
-                                    .send(DbMessage::Page {
+                                let msg = DbMessage::Page {
                                         id: current_page_id.parse().unwrap_or(0),
                                         ns: current_ns.parse().unwrap_or(0),
                                         title: current_title.clone(),
-                                    })
-                                    .ok();
+                                    };
+                                db_tx.send(msg.clone()).ok();
+                                messages.push(msg);
                             }
                         }
                         in_page = false;
@@ -210,7 +211,7 @@ pub fn process_file(
                                 "stdout".to_string()
                             };
 
-                            db_tx.send(DbMessage::Revision {
+                            let msg = DbMessage::Revision {
                                 rev_id: rev_id.parse().unwrap_or(0),
                                 parent_rev_id: parent_rev_id.parse().ok(),
                                 page_id: current_page_id.parse().unwrap_or(0),
@@ -218,7 +219,9 @@ pub fn process_file(
                                 offset_begin,
                                 length,
                                 timestamp: timestamp.clone(),
-                            }).ok();
+                            };
+                            db_tx.send(msg.clone()).ok();
+                            messages.push(msg);
 
                             rev_id.clear();
                             parent_rev_id.clear();
@@ -311,5 +314,5 @@ pub fn process_file(
         file_index,
         total_files
     );
-    Ok(())
+    Ok(messages)
 }

@@ -4,6 +4,7 @@ mod utils;
 mod db;
 mod processor;
 mod sync;
+mod parquet_writer;
 
 use std::fs;
 use std::io;
@@ -17,12 +18,21 @@ use crate::args::{Args, Commands};
 use crate::db::{db_worker, get_latest_timestamp};
 use crate::processor::process_file;
 use crate::sync::run_sync;
+use crate::parquet_writer::{write_parquet_batch, merge_parquet_files};
 
 fn main() -> io::Result<()> {
     let args = Args::parse();
     
     match args.command {
         Commands::Build(build_args) => {
+            if let Some(jobs) = build_args.jobs {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(jobs)
+                    .build_global()
+                    .unwrap_or_else(|e| {
+                        eprintln!("Warning: Failed to initialize thread pool with {} threads: {}", jobs, e);
+                    });
+            }
             let (db_tx, db_rx) = crossbeam_channel::bounded(10000);
             let mut db_path = build_args.db.clone();
 
@@ -73,15 +83,39 @@ fn main() -> io::Result<()> {
                 let total_files = entries.len();
                 let started_count = std::sync::atomic::AtomicUsize::new(0);
 
-                entries.into_par_iter().for_each(|path| {
+                let parquet_results: Vec<PathBuf> = entries.into_par_iter().enumerate().map(|(idx, path)| {
                     let file_index = started_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                    if let Err(e) = process_file(&path, Some(output_dir), &build_args.namespace, &db_tx, file_index, total_files, skip_siteinfo) {
-                        eprintln!("Error processing {:?}: {}", path, e);
-                    }
+                    let messages = match process_file(&path, Some(output_dir), &build_args.namespace, &db_tx, file_index, total_files, skip_siteinfo) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            eprintln!("Error processing {:?}: {}", path, e);
+                            Vec::new()
+                        }
+                    };
                     db_tx.send(DbMessage::Finalize).ok();
-                });
+
+                    if let Some(ref parquet_path) = build_args.parquet {
+                        let mut thread_parquet = parquet_path.clone();
+                        thread_parquet.set_extension(format!("{}.tmp.parquet", idx));
+                        if let Err(e) = write_parquet_batch(&thread_parquet, &messages) {
+                            eprintln!("Error writing parquet batch for {:?}: {}", path, e);
+                        }
+                        Some(thread_parquet)
+                    } else {
+                        None
+                    }
+                }).filter_map(|p| p).collect();
+
+                if let Some(ref parquet_path) = build_args.parquet {
+                    if let Err(e) = merge_parquet_files(&parquet_results, parquet_path) {
+                        eprintln!("Error merging parquet files: {}", e);
+                    }
+                    for p in parquet_results {
+                        fs::remove_file(p).ok();
+                    }
+                }
             } else if let Some(input_path) = build_args.input {
-                process_file(
+                let messages = process_file(
                     &input_path,
                     build_args.output_dir.as_deref(),
                     &build_args.namespace,
@@ -91,6 +125,12 @@ fn main() -> io::Result<()> {
                     skip_siteinfo,
                 )?;
                 db_tx.send(DbMessage::Finalize).ok();
+
+                if let Some(ref parquet_path) = build_args.parquet {
+                    if let Err(e) = write_parquet_batch(parquet_path, &messages) {
+                        eprintln!("Error writing parquet file: {}", e);
+                    }
+                }
             } else {
                 eprintln!("Usage: RevisionChest build <wikipedia_dump.xml.bz2|7z|xml> OR build -d <input_dir> -o <output_dir>");
                 std::process::exit(1);
@@ -102,6 +142,14 @@ fn main() -> io::Result<()> {
             db_thread.join().expect("Database thread panicked");
         }
         Commands::Sync(sync_args) => {
+            if let Some(jobs) = sync_args.jobs {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(jobs)
+                    .build_global()
+                    .unwrap_or_else(|e| {
+                        eprintln!("Warning: Failed to initialize thread pool with {} threads: {}", jobs, e);
+                    });
+            }
             let (db_tx, db_rx) = crossbeam_channel::bounded(10000);
             let mut db_path = sync_args.db.clone();
 
