@@ -61,9 +61,9 @@ By default, metadata is stored in a SQLite database named `index.db` in your out
 #### Parquet Export
 For high-performance processing without the overhead of a database, you can export metadata to a single Parquet file:
 ```bash
-./target/release/RevisionChest build -d <input_dir> -o <output_dir> --parquet metadata.parquet --no-db
+./target/release/RevisionChest build -d <input_dir> -o <output_dir> --parquet metadata.parquet
 ```
-The `--no-db` flag prevents the creation of the default SQLite file.
+The `--parquet` flag automatically prevents the creation of the default SQLite file (implies `--no-db`).
 
 #### PostgreSQL
 To use PostgreSQL, set the following environment variables in your `.env` file:
@@ -104,8 +104,17 @@ To sync recent changes for a specific domain:
 ./target/release/RevisionChest sync --domain en.wikipedia.org -o <output_directory>
 ```
 
+#### Parquet-based Sync
+You can use a Parquet file to determine the starting timestamp and store metadata for new revisions. This is useful for large-scale processing without a database:
+
+```bash
+./target/release/RevisionChest sync --domain en.wikipedia.org -o <output_dir> --parquet metadata.parquet
+```
+
+If `metadata.parquet` exists, RevisionChest will read the latest timestamp from it to resume the sync. New metadata will be written to the same Parquet file at the end of the sync cycle.
+
 **Key Features & Constraints:**
-- **Automatic Resume**: The command looks up the most recent timestamp in your database and fetches edits starting from that point (minus 24 hours to ensure overlap).
+- **Automatic Resume**: The command looks up the most recent timestamp in your database (or Parquet file if `--parquet` is used) and fetches edits starting from that point (minus 24 hours to ensure overlap).
 - **30-Day Limit**: If the most recent revision in your database is older than 30 days, the sync will fail, as Wikipedia's Recent Changes API only retains data for 30 days.
 - **Daily Rotation**: New revisions are stored in a `recentchanges/` subdirectory within your output folder, organized by date (e.g., `recentchanges/2026-05-26.mwrev.zst`).
 - **Incremental Appends**: If a file for a specific day already exists, the tool appends new data as a new Zstandard frame, preserving the validity of the archive.

@@ -45,6 +45,14 @@ pub struct SyncArgs {
     /// Number of concurrent jobs (default: number of logical CPUs)
     #[arg(short = 'j', long)]
     pub jobs: Option<usize>,
+
+    /// Output metadata to a Parquet file. Implies --no-db.
+    #[arg(long)]
+    pub parquet: Option<PathBuf>,
+
+    /// Do not create or update the database.
+    #[arg(long)]
+    pub no_db: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -76,7 +84,7 @@ pub struct BuildArgs {
     #[arg(long)]
     pub no_db: bool,
 
-    /// Output metadata to a Parquet file. Use with --no-db if you want to skip database ingestion entirely.
+    /// Output metadata to a Parquet file. Implies --no-db.
     #[arg(long)]
     pub parquet: Option<PathBuf>,
 

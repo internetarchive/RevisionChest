@@ -18,7 +18,7 @@ use crate::args::{Args, Commands};
 use crate::db::{db_worker, get_latest_timestamp};
 use crate::processor::process_file;
 use crate::sync::run_sync;
-use crate::parquet_writer::{write_parquet_batch, merge_parquet_files};
+use crate::parquet_writer::{write_parquet_batch, merge_parquet_files, get_latest_timestamp_from_parquet, parquet_worker};
 
 fn main() -> io::Result<()> {
     let args = Args::parse();
@@ -42,7 +42,7 @@ fn main() -> io::Result<()> {
                 }
             }
 
-            let no_db = build_args.no_db;
+            let no_db = build_args.no_db || build_args.parquet.is_some();
             let db_thread = thread::spawn(move || {
                 if no_db {
                     while let Ok(_) = db_rx.recv() {}
@@ -157,11 +157,26 @@ fn main() -> io::Result<()> {
                 db_path = sync_args.output_dir.join(db_path);
             }
 
-            let last_ts = get_latest_timestamp(db_path.clone());
-            
+            let mut last_ts = get_latest_timestamp(db_path.clone());
+            if last_ts.is_none() {
+                if let Some(ref p_path) = sync_args.parquet {
+                    last_ts = get_latest_timestamp_from_parquet(p_path);
+                }
+            }
+
+            let no_db = sync_args.no_db || sync_args.parquet.is_some();
+            let parquet_path = sync_args.parquet.clone();
             let db_path_for_worker = db_path.clone();
             let db_thread = thread::spawn(move || {
-                db_worker(db_rx, db_path_for_worker);
+                if no_db {
+                    if let Some(path) = parquet_path {
+                        parquet_worker(db_rx, path);
+                    } else {
+                        while let Ok(_) = db_rx.recv() {}
+                    }
+                } else {
+                    db_worker(db_rx, db_path_for_worker);
+                }
             });
 
             db_tx.send(DbMessage::SiteInfo { 

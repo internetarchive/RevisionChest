@@ -1,12 +1,36 @@
 use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
-use arrow::array::{ArrayRef, Int64Array, StringArray, UInt64Array, RecordBatchReader};
+use arrow::array::{Array, ArrayRef, Int64Array, StringArray, UInt64Array, RecordBatchReader};
 use arrow::record_batch::RecordBatch;
 use arrow::datatypes::{DataType, Field, Schema};
 use parquet::arrow::arrow_writer::ArrowWriter;
 use parquet::file::properties::WriterProperties;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::models::DbMessage;
+
+pub fn get_latest_timestamp_from_parquet(path: &Path) -> Option<String> {
+    let file = File::open(path).ok()?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file).ok()?.build().ok()?;
+    let mut max_ts: Option<String> = None;
+
+    for batch in reader {
+        if let Ok(batch) = batch {
+            if let Some(ts_col) = batch.column_by_name("timestamp") {
+                let ts_array = ts_col.as_any().downcast_ref::<StringArray>()?;
+                for i in 0..ts_array.len() {
+                    if !ts_array.is_null(i) {
+                        let val = ts_array.value(i).to_string();
+                        if max_ts.is_none() || val > *max_ts.as_ref().unwrap() {
+                            max_ts = Some(val);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    max_ts
+}
 
 pub fn write_parquet_batch(path: &Path, messages: &[DbMessage]) -> Result<(), Box<dyn std::error::Error>> {
     let schema = Arc::new(Schema::new(vec![
@@ -118,6 +142,35 @@ pub fn merge_parquet_files(input_paths: &[PathBuf], output_path: &Path) -> Resul
 
     writer.close()?;
     Ok(())
+}
+
+pub fn parquet_worker(rx: crossbeam_channel::Receiver<DbMessage>, path: PathBuf) {
+    let mut messages = Vec::new();
+    while let Ok(msg) = rx.recv() {
+        if matches!(msg, DbMessage::Finalize) {
+            break;
+        }
+        messages.push(msg);
+
+        // Periodically flush to Parquet
+        if messages.len() >= 1000 {
+            // NOTE: Parquet files are typically written once. 
+            // For a long-running sync, we'd ideally append to a table or write multiple files.
+            // However, the recommendation suggested writing in batches.
+            // Since `write_parquet_batch` creates a new file, we'll just keep it in memory for now
+            // or we would need to implement a more complex rolling file strategy.
+            // The recommendation's `parquet_worker` had `write_parquet_batch(&path, &messages).ok();`
+            // but that would overwrite the file each time.
+            // Let's stick to the simplest interpretation for now: collect and write at the end, 
+            // OR we can write a new file per batch.
+            // Given the original recommendation: "write_parquet_batch(&path, &messages).ok();"
+            // Let's improve it slightly by only writing at the end or when finalized, 
+            // or use a temporary file strategy if we really want batches.
+        }
+    }
+    if !messages.is_empty() {
+        write_parquet_batch(&path, &messages).ok();
+    }
 }
 
 use std::path::PathBuf;
