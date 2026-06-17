@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, Int64Array, StringArray, UInt64Array, RecordBatchReader};
 use arrow::record_batch::RecordBatch;
@@ -8,6 +9,7 @@ use parquet::arrow::arrow_writer::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::models::DbMessage;
+use crate::utils::normalize_timestamp_utc;
 
 pub fn get_latest_timestamp_from_parquet(path: &Path) -> Option<String> {
     let file = File::open(path).ok()?;
@@ -21,8 +23,10 @@ pub fn get_latest_timestamp_from_parquet(path: &Path) -> Option<String> {
                 for i in 0..ts_array.len() {
                     if !ts_array.is_null(i) {
                         let val = ts_array.value(i).to_string();
-                        if max_ts.is_none() || val > *max_ts.as_ref().unwrap() {
-                            max_ts = Some(val);
+                        if let Ok(normalized) = normalize_timestamp_utc(&val) {
+                            if max_ts.as_ref().is_none_or(|current| normalized > *current) {
+                                max_ts = Some(normalized);
+                            }
                         }
                     }
                 }
@@ -173,4 +177,45 @@ pub fn parquet_worker(rx: crossbeam_channel::Receiver<DbMessage>, path: PathBuf)
     }
 }
 
-use std::path::PathBuf;
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crate::models::DbMessage;
+
+    use super::{get_latest_timestamp_from_parquet, write_parquet_batch};
+
+    #[test]
+    fn latest_timestamp_from_parquet_normalizes_before_comparing() {
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!("revisionchest-{unique}.parquet"));
+        let messages = vec![
+            DbMessage::Revision {
+                rev_id: 1,
+                parent_rev_id: None,
+                page_id: 10,
+                file_path: "recentchanges/2026-05-31.mwrev.zst".to_string(),
+                offset_begin: 0,
+                length: 100,
+                timestamp: "2026-05-31T23:59:54Z".to_string(),
+            },
+            DbMessage::Revision {
+                rev_id: 2,
+                parent_rev_id: Some(1),
+                page_id: 10,
+                file_path: "recentchanges/2026-05-31.mwrev.zst".to_string(),
+                offset_begin: 100,
+                length: 120,
+                timestamp: "2026-05-31 23:59:55".to_string(),
+            },
+        ];
+
+        write_parquet_batch(&path, &messages).unwrap();
+
+        let latest = get_latest_timestamp_from_parquet(&path);
+        fs::remove_file(&path).ok();
+
+        assert_eq!(latest.as_deref(), Some("2026-05-31T23:59:55Z"));
+    }
+}

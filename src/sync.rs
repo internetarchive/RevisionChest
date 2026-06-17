@@ -1,7 +1,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
-use chrono::{DateTime, Utc, Duration, Local};
+use chrono::{Utc, Duration, Local};
 use crossbeam_channel::Sender;
 use reqwest::blocking::Client;
 use serde_json::Value;
@@ -9,6 +9,7 @@ use moka::sync::Cache;
 use crate::models::DbMessage;
 use crate::args::SyncArgs;
 use crate::db::filter_existing_revisions;
+use crate::utils::parse_timestamp_utc;
 
 pub fn run_sync(args: SyncArgs, db_tx: Sender<DbMessage>, last_ts_str: Option<String>) -> io::Result<()> {
     let mut db_path = args.db.clone();
@@ -22,9 +23,7 @@ pub fn run_sync(args: SyncArgs, db_tx: Sender<DbMessage>, last_ts_str: Option<St
 
     let mut current_last_ts = if let Some(ts_str) = last_ts_str {
         let now = Utc::now();
-        let ts = DateTime::parse_from_rfc3339(&ts_str)
-            .or_else(|_| DateTime::parse_from_str(&ts_str, "%Y-%m-%dT%H:%M:%SZ"))
-            .map(|dt| dt.with_timezone(&Utc))
+        let ts = parse_timestamp_utc(&ts_str)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Failed to parse timestamp {}: {}", ts_str, e)))?;
         
         if now - ts > Duration::days(30) {
@@ -105,8 +104,8 @@ pub fn run_sync(args: SyncArgs, db_tx: Sender<DbMessage>, last_ts_str: Option<St
                 // Update batch_start_ts to the timestamp of the last item in this batch
                 if let Some(last_rc) = rcs.last() {
                     if let Some(last_ts_str) = last_rc["timestamp"].as_str() {
-                        if let Ok(last_ts) = DateTime::parse_from_rfc3339(last_ts_str) {
-                            batch_start_ts = last_ts.with_timezone(&Utc);
+                        if let Ok(last_ts) = parse_timestamp_utc(last_ts_str) {
+                            batch_start_ts = last_ts;
                             current_last_ts = batch_start_ts;
                         }
                     }
