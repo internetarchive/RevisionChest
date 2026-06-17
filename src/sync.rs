@@ -116,7 +116,11 @@ pub fn run_sync(args: SyncArgs, db_tx: Sender<DbMessage>, last_ts_str: Option<St
                     .filter_map(|rc| rc["revid"].as_u64())
                     .collect();
 
-                let rev_ids = filter_existing_revisions(db_path.clone(), rev_ids);
+    let rev_ids = if args.no_db {
+        rev_ids
+    } else {
+        filter_existing_revisions(db_path.clone(), rev_ids)
+    };
 
                 let rev_ids: Vec<u64> = rev_ids.into_iter()
                     .filter(|id| !processed_cache.contains_key(id))

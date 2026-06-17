@@ -8,6 +8,7 @@ RevisionChest is a high-performance Rust utility designed to extract and compres
 - **Parallel Processing**: Efficiently processes multiple dump files in parallel using the `rayon` library.
 - **Zstandard Compression**: Outputs revisions in a space-efficient `.zst` format.
 - **Metadata Extraction**: Captures key revision metadata including page ID, namespace, revision ID, parent ID, timestamp, and contributor ID.
+- **Flexible Metadata Storage**: Store metadata in a SQLite database, a PostgreSQL database, or export it to a high-performance Parquet file.
 
 ## Installation
 
@@ -47,6 +48,40 @@ To process all `.bz2` and `.7z` files in a directory in parallel:
 
 When using the `-d` (directory) flag, the `-o` (output directory) flag is **required**. Each input file will generate a corresponding `.mwrev.zst` file in the output directory.
 
+### Metadata Storage Options
+
+RevisionChest provides several ways to store or export metadata.
+
+#### SQLite (Default)
+By default, metadata is stored in a SQLite database named `index.db` in your output directory:
+```bash
+./target/release/RevisionChest build -d <input_dir> -o <output_dir> --db index.db
+```
+
+#### Parquet Export
+For high-performance processing without the overhead of a database, you can export metadata to a single Parquet file:
+```bash
+./target/release/RevisionChest build -d <input_dir> -o <output_dir> --parquet metadata.parquet
+```
+The `--parquet` flag automatically prevents the creation of the default SQLite file (implies `--no-db`).
+
+#### PostgreSQL
+To use PostgreSQL, set the following environment variables in your `.env` file:
+```env
+DATABASE=postgres
+DB_HOST=localhost
+DB_PORT=5432
+DB_NAME=revision_chest
+DB_USER=your_user
+DB_PASS=your_password
+```
+
+#### Disabling Metadata Storage
+If you only need the `.mwrev.zst` files and don't want to save metadata:
+```bash
+./target/release/RevisionChest build -d <input_dir> -o <output_dir> --no-db
+```
+
 ## Synchronizing Recent Changes
 
 The `sync` command allows you to fetch the most recent Wikipedia edits and update your local index and data files. It bridges the gap between static XML dumps and live data.
@@ -69,8 +104,17 @@ To sync recent changes for a specific domain:
 ./target/release/RevisionChest sync --domain en.wikipedia.org -o <output_directory>
 ```
 
+#### Parquet-based Sync
+You can use a Parquet file to determine the starting timestamp and store metadata for new revisions. This is useful for large-scale processing without a database:
+
+```bash
+./target/release/RevisionChest sync --domain en.wikipedia.org -o <output_dir> --parquet metadata.parquet
+```
+
+If `metadata.parquet` exists, RevisionChest will read the latest timestamp from it to resume the sync. New metadata will be written to the same Parquet file at the end of the sync cycle.
+
 **Key Features & Constraints:**
-- **Automatic Resume**: The command looks up the most recent timestamp in your database and fetches edits starting from that point (minus 24 hours to ensure overlap).
+- **Automatic Resume**: The command looks up the most recent timestamp in your database (or Parquet file if `--parquet` is used) and fetches edits starting from that point (minus 24 hours to ensure overlap).
 - **30-Day Limit**: If the most recent revision in your database is older than 30 days, the sync will fail, as Wikipedia's Recent Changes API only retains data for 30 days.
 - **Daily Rotation**: New revisions are stored in a `recentchanges/` subdirectory within your output folder, organized by date (e.g., `recentchanges/2026-05-26.mwrev.zst`).
 - **Incremental Appends**: If a file for a specific day already exists, the tool appends new data as a new Zstandard frame, preserving the validity of the archive.
@@ -108,3 +152,7 @@ The output `.mwrev.zst` files contain revisions in the following format:
 - `rayon`: For parallel data processing.
 - `clap`: For command-line argument parsing.
 - `chrono`: For logging timestamps.
+- `parquet`: For high-performance metadata export.
+- `arrow`: For columnar data representation.
+- `rusqlite`: For SQLite database support.
+- `postgres`: For PostgreSQL database support.
