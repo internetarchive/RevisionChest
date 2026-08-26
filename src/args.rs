@@ -42,6 +42,10 @@ pub struct SyncArgs {
     #[arg(long)]
     pub interval: Option<u64>,
 
+    /// Overlap in minutes when resuming sync (default: 60)
+    #[arg(long)]
+    pub overlap: Option<u64>,
+
     /// Number of concurrent jobs (default: number of logical CPUs)
     #[arg(short = 'j', long)]
     pub jobs: Option<usize>,

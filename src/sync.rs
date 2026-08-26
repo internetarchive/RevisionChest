@@ -21,6 +21,10 @@ pub fn run_sync(args: SyncArgs, db_tx: Sender<DbMessage>, last_ts_str: Option<St
         .or_else(|| std::env::var("SYNC_INTERVAL").ok().and_then(|v| v.parse().ok()))
         .unwrap_or(10);
 
+    let overlap_mins = args.overlap
+        .or_else(|| std::env::var("SYNC_OVERLAP").ok().and_then(|v| v.parse().ok()))
+        .unwrap_or(60);
+
     let mut current_last_ts = if let Some(ts_str) = last_ts_str {
         let now = Utc::now();
         let ts = parse_timestamp_utc(&ts_str)
@@ -33,7 +37,7 @@ pub fn run_sync(args: SyncArgs, db_tx: Sender<DbMessage>, last_ts_str: Option<St
             ));
         }
 
-        ts - Duration::hours(1)
+        ts - Duration::minutes(overlap_mins as i64)
     } else {
         Utc::now() - Duration::hours(24)
     };
