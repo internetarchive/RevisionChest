@@ -114,7 +114,7 @@ You can use a Parquet file to determine the starting timestamp and store metadat
 If `metadata.parquet` exists, RevisionChest will read the latest timestamp from it to resume the sync. New metadata will be written to the same Parquet file at the end of the sync cycle.
 
 **Key Features & Constraints:**
-- **Automatic Resume**: The command looks up the most recent timestamp in your database (or Parquet file if `--parquet` is used) and fetches edits starting from that point (minus 24 hours to ensure overlap).
+- **Automatic Resume**: The command looks up the most recent timestamp in your database (or Parquet file if `--parquet` is used) and fetches edits starting from that point (minus 1 hour to ensure overlap). For a fresh sync with no existing data, a 24-hour lookback is used.
 - **30-Day Limit**: If the most recent revision in your database is older than 30 days, the sync will fail, as Wikipedia's Recent Changes API only retains data for 30 days.
 - **Daily Rotation**: New revisions are stored in a `recentchanges/` subdirectory within your output folder, organized by date (e.g., `recentchanges/2026-05-26.mwrev.zst`).
 - **Incremental Appends**: If a file for a specific day already exists, the tool appends new data as a new Zstandard frame, preserving the validity of the archive.

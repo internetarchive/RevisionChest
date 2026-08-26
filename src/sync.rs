@@ -33,7 +33,7 @@ pub fn run_sync(args: SyncArgs, db_tx: Sender<DbMessage>, last_ts_str: Option<St
             ));
         }
 
-        ts - Duration::hours(24)
+        ts - Duration::hours(1)
     } else {
         Utc::now() - Duration::hours(24)
     };
