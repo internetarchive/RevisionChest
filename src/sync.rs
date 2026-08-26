@@ -30,7 +30,7 @@ fn request_with_retry(
                     return Err(io::Error::new(io::ErrorKind::Other,
                         format!("Failed to decode response after {} attempts: {}", max_retries + 1, e)));
                 }
-                let delay = std::time::Duration::from_millis(100 * 2u64.pow(attempt.min(20)));
+                let delay = std::time::Duration::from_secs(2u64.pow(attempt.min(20)));
                 eprintln!(
                     "[{}] Failed to decode response (attempt {}/{}): {}. Retrying in {:?}...",
                     Local::now().format("%Y-%m-%d %H:%M:%S"),
