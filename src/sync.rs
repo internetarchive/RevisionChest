@@ -11,6 +11,41 @@ use crate::args::SyncArgs;
 use crate::db::filter_existing_revisions;
 use crate::utils::parse_timestamp_utc;
 
+fn request_with_retry(
+    client: &Client,
+    url: &str,
+    params: &[(&str, &str)],
+    max_retries: u32,
+) -> io::Result<Value> {
+    for attempt in 0..=max_retries {
+        let response = client.get(url)
+            .query(params)
+            .send()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        match response.json::<Value>() {
+            Ok(val) => return Ok(val),
+            Err(e) => {
+                if attempt == max_retries {
+                    return Err(io::Error::new(io::ErrorKind::Other,
+                        format!("Failed to decode response after {} attempts: {}", max_retries + 1, e)));
+                }
+                let delay = std::time::Duration::from_millis(100 * 2u64.pow(attempt.min(20)));
+                eprintln!(
+                    "[{}] Failed to decode response (attempt {}/{}): {}. Retrying in {:?}...",
+                    Local::now().format("%Y-%m-%d %H:%M:%S"),
+                    attempt + 1,
+                    max_retries + 1,
+                    e,
+                    delay
+                );
+                std::thread::sleep(delay);
+            }
+        }
+    }
+    unreachable!()
+}
+
 pub fn run_sync(args: SyncArgs, db_tx: Sender<DbMessage>, last_ts_str: Option<String>) -> io::Result<()> {
     let mut db_path = args.db.clone();
     if db_path.is_relative() {
@@ -91,12 +126,7 @@ pub fn run_sync(args: SyncArgs, db_tx: Sender<DbMessage>, last_ts_str: Option<St
                 params.push(("rccontinue", c));
             }
 
-            let resp = client.get(&rc_url)
-                .query(&params)
-                .send()
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
-                .json::<Value>()
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            let resp = request_with_retry(&client, &rc_url, &params, args.max_retries)?;
 
             let recent_changes = resp["query"]["recentchanges"].as_array();
             
@@ -152,7 +182,7 @@ pub fn run_sync(args: SyncArgs, db_tx: Sender<DbMessage>, last_ts_str: Option<St
                         Local::now().format("%Y-%m-%d %H:%M:%S"),
                         chunk.len()
                     );
-                    fetch_and_process_revisions(&client, &rc_url, chunk, &args.output_dir, &db_tx, &args.namespace)?;
+                    fetch_and_process_revisions(&client, &rc_url, chunk, &args.output_dir, &db_tx, &args.namespace, args.max_retries)?;
                     for &id in chunk {
                         processed_cache.insert(id, ());
                     }
@@ -190,26 +220,23 @@ fn fetch_and_process_revisions(
     output_dir: &Path,
     db_tx: &Sender<DbMessage>,
     allowed_namespaces: &Option<Vec<String>>,
+    max_retries: u32,
 ) -> io::Result<()> {
     if rev_ids.is_empty() {
         return Ok(());
     }
     let ids_str = rev_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join("|");
     
-    let resp = client.get(api_url)
-        .query(&[
-            ("action", "query"),
-            ("prop", "revisions"),
-            ("revids", &ids_str),
-            ("rvprop", "ids|timestamp|user|content|userid|flags"),
-            ("rvslots", "main"),
-            ("format", "json"),
-            ("formatversion", "2"),
-        ])
-        .send()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
-        .json::<Value>()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let params: Vec<(&str, &str)> = vec![
+        ("action", "query"),
+        ("prop", "revisions"),
+        ("revids", &ids_str),
+        ("rvprop", "ids|timestamp|user|content|userid|flags"),
+        ("rvslots", "main"),
+        ("format", "json"),
+        ("formatversion", "2"),
+    ];
+    let resp = request_with_retry(client, api_url, &params, max_retries)?;
 
     let pages = if resp["query"]["pages"].is_array() {
         resp["query"]["pages"].as_array().map(|a| a.iter().collect::<Vec<_>>())

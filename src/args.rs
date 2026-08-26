@@ -57,6 +57,10 @@ pub struct SyncArgs {
     /// Do not create or update the database.
     #[arg(long)]
     pub no_db: bool,
+
+    /// Maximum number of retries for API requests on decode failure (default: 15)
+    #[arg(long, default_value = "15")]
+    pub max_retries: u32,
 }
 
 #[derive(Parser, Debug)]
