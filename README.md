@@ -1,158 +1,135 @@
 # RevisionChest
 
-RevisionChest is a high-performance Rust utility designed to extract and compress revision history from Wikipedia XML dumps. It supports `.bz2` and `.7z` compressed XML dumps and outputs the extracted data in a custom `.mwrev.zst` format using Zstandard compression.
+RevisionChest turns MediaWiki XML dumps into compact `.mwrev.zst` revision
+bundles — every revision's text, in order, zstd-compressed — and records
+where each revision landed, so that a pipeline can read any revision's text
+by `(bundle, offset, length)` without ever touching the XML again. It also
+keeps bundles current from a wiki's recent changes.
 
-## Features
+It is the first stage of the [Wikipedia Citations Database](https://github.com/internetarchive/wiki-references-db)
+pipeline, and is organised as reusable crates so that other tools can read
+dumps and bundles the same way.
 
-- **Format Support**: Processes Wikipedia XML dumps compressed with `bzip2` (`.bz2`) or `7-Zip` (`.7z`). Note that bz2 has better performance due to support for streaming decompression.
-- **Parallel Processing**: Efficiently processes multiple dump files in parallel using the `rayon` library.
-- **Zstandard Compression**: Outputs revisions in a space-efficient `.zst` format.
-- **Metadata Extraction**: Captures key revision metadata including page ID, namespace, revision ID, parent ID, timestamp, and contributor ID.
-- **Flexible Metadata Storage**: Store metadata in a SQLite database, a PostgreSQL database, or export it to a high-performance Parquet file.
+## Crates
 
-## Installation
+| Crate | What it is |
+|---|---|
+| [`mwdump`](crates/mwdump) | Streaming reader for MediaWiki XML dumps (`.xml`, `.bz2`, `.gz`, `.7z` — all streamed, 7z included). One event per site-info block, page start, revision and page end; a revision carries page id, namespace, ids, timestamp, contributor, flags, comment, model, text and the dump's SHA-1. Nothing larger than one revision is held in memory. |
+| [`mwrev`](crates/mwrev) | The `.mwrev.zst` bundle format: header line + space-prefixed text lines per revision. `BundleWriter` (create or append, with decompressed byte offsets), `BundleReader` (streams every frame back), `RevisionHeader` parse/format, `read_at` for tooling. |
+| [`revisionchest-meta`](crates/revisionchest-meta) | Where the metadata goes: `MetaEvent` (site, page, revision location), the `MetaSink` trait, a `ParquetSink` (feature `parquet`, default) and a `PostgresSink` (feature `postgres`) that writes the WCD schema — `domains`, `revision_bundles`, `revisions`, `page_metadata`, article `web_resources`. |
+| [`revisionchest`](crates/revisionchest) | The `RevisionChest` binary: `build` (dumps → bundles, in parallel over a directory) and `sync` (recent changes → daily bundles). |
 
-Ensure you have [Rust and Cargo](https://rustup.rs/) installed. Clone the repository and build the project:
+The crates depend only downwards: `revisionchest` → `mwdump`, `mwrev`,
+`revisionchest-meta`; the three libraries are independent of each other.
+
+## Building
+
+Stable Rust ≥ 1.85 (edition 2024).
 
 ```bash
-cargo build --release
+cargo build --release                      # binary at target/release/RevisionChest
+cargo build --release --no-default-features -p revisionchest   # without Postgres support
+cargo test --workspace
 ```
-
-The binary will be available at `target/release/RevisionChest`.
 
 ## Usage
 
-RevisionChest can be used to process a single file or an entire directory of dump files.
-
-### Processing a Single File
-
-To process a single Wikipedia dump file and output to standard output:
+### Building bundles from dumps
 
 ```bash
-./target/release/RevisionChest build <path_to_dump.xml.bz2_or_7z>
+# one dump; the bundle text goes to stdout uncompressed
+RevisionChest build enwiki-20260901-pages-meta-history1.xml-p1p857.bz2
+
+# one dump into a directory → <dir>/enwiki-…-p1p857.mwrev.zst
+RevisionChest build enwiki-…-p1p857.bz2 -o bundles/
+
+# every .bz2/.7z/.gz/.xml in a directory, in parallel (-j N to limit)
+RevisionChest build -d dumps/ -o bundles/ --parquet bundles/metadata.parquet
 ```
 
-To process a single file and save the output to a specific directory:
+Options: `--namespace 0,118` keeps only those namespaces; `--domain
+en.wikipedia.org` overrides the domain read from the dump's `<siteinfo>`
+(needed for dumps without one).
+
+### Where the metadata goes
+
+Bundles alone are not enough to find a revision; `build` and `sync` record
+`(page_id, rev_id, parent, timestamp, bundle, offset_begin, length)` and the
+page titles and namespaces to one or both of:
+
+- `--parquet FILE` — one Parquet file with a `type` column (`page` /
+  `revision`); for `sync`, pass a directory and each run writes its own
+  file there.
+- `--postgres` — the WCD Postgres schema. Connection from `DATABASE_URL`,
+  or `DB_HOST`/`DB_PORT`/`DB_NAME`/`DB_USER`/`DB_PASS` (a `.env` file is
+  read). `DATABASE=postgres` in the environment also turns it on. The
+  tables must already exist (`wcd init-db` in the monorepo).
+
+With neither, only the bundles are written. (There is no SQLite index any
+more; `--no-db` is accepted and ignored.)
+
+### Synchronizing recent changes
 
 ```bash
-./target/release/RevisionChest build <path_to_dump.xml.bz2> -o <output_directory>
+RevisionChest sync --domain en.wikipedia.org -o bundles/ --namespace 0 --parquet bundles/sync/
+RevisionChest sync --domain en.wikipedia.org -o bundles/ --postgres --ongoing --interval 5
 ```
 
-### Processing an Entire Directory
+`sync` polls `list=recentchanges`, fetches the content of revisions it has
+not recorded yet, and appends them to `bundles/recentchanges/<YYYY-MM-DD>.mwrev.zst`
+(one new zstd frame per batch). It resumes from the latest recorded
+revision timestamp minus 24 hours — read from Postgres, or from the Parquet
+file(s) — or from `--since`; with nothing recorded it starts 24 hours ago.
+Recent changes only reach back 30 days, so a store older than that must be
+rebuilt from a dump. With `--postgres`, revisions already in the database are
+skipped; otherwise an in-memory cache deduplicates within a run.
 
-To process all `.bz2` and `.7z` files in a directory in parallel:
+Set a User-Agent contact for the Wikimedia API policy: `UA_CONTACT_INFO`
+(or `CONTACT_EMAIL`), optionally `UA_APP_NAME` / `UA_APP_VERSION`, in the
+environment or `.env`.
 
-```bash
-./target/release/RevisionChest build -d <input_directory> -o <output_directory>
-```
-
-When using the `-d` (directory) flag, the `-o` (output directory) flag is **required**. Each input file will generate a corresponding `.mwrev.zst` file in the output directory.
-
-### Metadata Storage Options
-
-RevisionChest provides several ways to store or export metadata.
-
-#### SQLite (Default)
-By default, metadata is stored in a SQLite database named `index.db` in your output directory:
-```bash
-./target/release/RevisionChest build -d <input_dir> -o <output_dir> --db index.db
-```
-
-#### Parquet Export
-For high-performance processing without the overhead of a database, you can export metadata to a single Parquet file:
-```bash
-./target/release/RevisionChest build -d <input_dir> -o <output_dir> --parquet metadata.parquet
-```
-The `--parquet` flag automatically prevents the creation of the default SQLite file (implies `--no-db`).
-
-#### PostgreSQL
-To use PostgreSQL, set the following environment variables in your `.env` file:
-```env
-DATABASE=postgres
-DB_HOST=localhost
-DB_PORT=5432
-DB_NAME=revision_chest
-DB_USER=your_user
-DB_PASS=your_password
-```
-
-#### Disabling Metadata Storage
-If you only need the `.mwrev.zst` files and don't want to save metadata:
-```bash
-./target/release/RevisionChest build -d <input_dir> -o <output_dir> --no-db
-```
-
-## Synchronizing Recent Changes
-
-The `sync` command allows you to fetch the most recent Wikipedia edits and update your local index and data files. It bridges the gap between static XML dumps and live data.
-
-### Configuration
-
-To comply with Wikipedia's API policy, you must define a User-Agent in a `.env` file in the project root. You can use `example.env` as a template:
-
-```env
-UA_APP_NAME=RevisionChest
-UA_APP_VERSION=0.1.0
-UA_CONTACT_INFO=https://github.com/yourusername/RevisionChest
-```
-
-### Usage
-
-To sync recent changes for a specific domain:
-
-```bash
-./target/release/RevisionChest sync --domain en.wikipedia.org -o <output_directory>
-```
-
-#### Parquet-based Sync
-You can use a Parquet file to determine the starting timestamp and store metadata for new revisions. This is useful for large-scale processing without a database:
-
-```bash
-./target/release/RevisionChest sync --domain en.wikipedia.org -o <output_dir> --parquet metadata.parquet
-```
-
-If `metadata.parquet` exists, RevisionChest will read the latest timestamp from it to resume the sync. New metadata will be written to the same Parquet file at the end of the sync cycle.
-
-**Key Features & Constraints:**
-- **Automatic Resume**: The command looks up the most recent timestamp in your database (or Parquet file if `--parquet` is used) and fetches edits starting from that point (minus 24 hours to ensure overlap).
-- **30-Day Limit**: If the most recent revision in your database is older than 30 days, the sync will fail, as Wikipedia's Recent Changes API only retains data for 30 days.
-- **Daily Rotation**: New revisions are stored in a `recentchanges/` subdirectory within your output folder, organized by date (e.g., `recentchanges/2026-05-26.mwrev.zst`).
-- **Incremental Appends**: If a file for a specific day already exists, the tool appends new data as a new Zstandard frame, preserving the validity of the archive.
-- **Namespace Filtering**: You can restrict the sync to specific namespaces:
-  ```bash
-  ./target/release/RevisionChest sync --domain en.wikipedia.org -o <output_directory> --namespace 0,118
-  ```
-- **Ongoing Sync**: Keep the tool running and poll for new changes periodically:
-  ```bash
-  ./target/release/RevisionChest sync --domain en.wikipedia.org -o <output_directory> --ongoing --interval 5
-  ```
-  The interval defaults to 10 minutes and can also be set via `SYNC_INTERVAL` in `.env`.
-
-## Output Format
-
-The output `.mwrev.zst` files contain revisions in the following format:
+## The bundle format
 
 ```text
-# page_id=... ns=... rev_id=... parent_rev_id=... timestamp=... user_id=...
- <line of text>
- <line of text>
-...
+# page_id=101 ns=0 rev_id=1001 parent_rev_id= timestamp=2004-01-01T00:00:00Z user_id=7
+ '''Example Island''' is an island.
+ 
+ == References ==
+# page_id=101 ns=0 rev_id=1002 parent_rev_id=1001 timestamp=2005-06-15T12:00:00Z user_id=0
+ …
 ```
 
-- Each revision starts with a header line beginning with `#`.
-- The actual revision text follows, with each line prefixed by a single space.
-- The output is compressed using Zstandard.
+`parent_rev_id` is empty for a first revision; `user_id` is `0` for
+anonymous or hidden contributors. Text is written line by line, so a
+trailing newline is not kept and `\r\n` becomes `\n`.
 
-## Dependencies
+**Offsets** are decompressed byte offsets from the start of the bundle's
+content, across all of its zstd frames: `offset_begin` points at the first
+space-prefixed text line and `length` covers the text lines. A bundle that
+`sync` appends to keeps a `<bundle>.len` sidecar with its decompressed
+length so the next append continues the count; if the sidecar is missing
+the bundle is measured once.
 
-- `bzip2`: For decompressing `.bz2` files.
-- `sevenz-rust`: For decompressing `.7z` files.
-- `quick-xml`: For fast XML parsing.
-- `zstd`: For Zstandard compression.
-- `rayon`: For parallel data processing.
-- `clap`: For command-line argument parsing.
-- `chrono`: For logging timestamps.
-- `parquet`: For high-performance metadata export.
-- `arrow`: For columnar data representation.
-- `rusqlite`: For SQLite database support.
-- `postgres`: For PostgreSQL database support.
+Reading a revision back therefore means decompressing the bundle up to
+`offset_begin` — sequential, as the pipeline consumes bundles — rather than
+seeking; `mwrev::read_at` does that for tooling.
+
+## Changes from 0.1
+
+- Split into four crates; the binary's command line is unchanged except
+  that `--db` (the SQLite index) is gone and `--postgres` is explicit.
+- `.7z` dumps are streamed; previously the whole decompressed dump was read
+  into memory first.
+- `.gz` dumps are accepted.
+- Revision text is taken verbatim; leading and trailing whitespace of a
+  revision is no longer trimmed.
+- `sync` offsets were wrong (a compressed file size added to an
+  uncompressed in-frame offset); they are now decompressed offsets like
+  `build`'s. Bundles written by `build` are byte-for-byte the same as before.
+- The metadata file name for a plain `.xml` dump now matches the bundle
+  actually written (`fixture.mwrev.zst`, not `fixture.xml.mwrev.zst`).
+- Postgres: `revisions.revision_timestamp` is written as `TIMESTAMP`,
+  `revisions.domain_id` is set, page titles and namespaces go to
+  `page_metadata (domain_id, page_id)`, and nothing is written to
+  `documents`.
+- A truncated dump is an error rather than a silent end of input.

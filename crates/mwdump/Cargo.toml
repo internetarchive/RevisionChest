@@ -1,0 +1,19 @@
+[package]
+name = "mwdump"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Streaming reader for MediaWiki XML dumps (pages-meta-history and friends): one event per page start, revision and page end, from .xml, .bz2, .gz or .7z"
+publish = false
+
+[dependencies]
+quick-xml.workspace = true
+bzip2.workspace = true
+flate2.workspace = true
+sevenz-rust.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

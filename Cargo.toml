@@ -1,27 +1,51 @@
-[package]
-name = "RevisionChest"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+resolver = "2"
+members = [
+    "crates/mwdump",
+    "crates/mwrev",
+    "crates/revisionchest-meta",
+    "crates/revisionchest",
+]
 
-[dependencies]
+[workspace.package]
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/internetarchive/RevisionChest"
+
+[workspace.dependencies]
+mwdump = { path = "crates/mwdump" }
+mwrev = { path = "crates/mwrev" }
+revisionchest-meta = { path = "crates/revisionchest-meta" }
+
+# dump reading
+quick-xml = "0.37"
 bzip2 = "0.4"
-quick-xml = { version = "0.37", features = ["serialize"] }
-serde = { version = "1.0", features = ["derive"] }
+flate2 = "1"
 sevenz-rust = "0.6"
-rayon = "1.10"
+# bundles
 zstd = "0.13"
-clap = { version = "4.5", features = ["derive"] }
-chrono = "0.4"
-rusqlite = { version = "0.32", features = ["bundled"] }
-crossbeam-channel = "0.5"
-dotenvy = "0.15"
+# metadata sinks
+parquet = "53.0"
+arrow = "53.0"
 postgres = "0.19"
 r2d2 = "0.8"
 r2d2_postgres = "0.18"
+md5 = "0.7"
+# binary
+clap = { version = "4.5", features = ["derive"] }
+rayon = "1.10"
+crossbeam-channel = "0.5"
+chrono = "0.4"
+dotenvy = "0.15"
 reqwest = { version = "0.12", features = ["blocking", "json"] }
 serde_json = "1.0"
-url = "2.5"
 moka = { version = "0.12", features = ["sync"] }
-md5 = "0.7"
-parquet = "53.0"
-arrow = "53.0"
+url = "2.5"
+thiserror = "2"
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
