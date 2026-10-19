@@ -35,7 +35,7 @@ CREATE TABLE page_metadata (
 );
 CREATE TABLE web_resources (
     id                   SERIAL PRIMARY KEY,
-    url                  VARCHAR,
+    url                  VARCHAR NOT NULL,
     url_hash             CHAR(32) NOT NULL UNIQUE,
     instance_of_document INTEGER,
     availability_status  INTEGER,
