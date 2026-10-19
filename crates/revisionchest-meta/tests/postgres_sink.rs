@@ -4,12 +4,18 @@
 #![cfg(feature = "postgres")]
 
 use postgres::{Client, NoTls};
-use revisionchest_meta::postgres::{PostgresConfig, PostgresSink, existing_revisions, latest_timestamp};
+use revisionchest_meta::postgres::{
+    PostgresConfig, PostgresSink, existing_revisions, latest_timestamp,
+};
 use revisionchest_meta::{MetaEvent, MetaSink};
 
 fn config() -> Option<PostgresConfig> {
     let url = std::env::var("REVISIONCHEST_TEST_DATABASE_URL").ok()?;
-    Some(PostgresConfig { url, workers: 2, batch_size: 3 })
+    Some(PostgresConfig {
+        url,
+        workers: 2,
+        batch_size: 3,
+    })
 }
 
 fn reset(cfg: &PostgresConfig) {
@@ -29,13 +35,28 @@ fn events() -> Vec<MetaEvent> {
         timestamp: ts.into(),
     };
     vec![
-        MetaEvent::SiteInfo { domain: "en.wikipedia.org".into(), language_code: Some("en".into()) },
-        MetaEvent::Page { id: 101, ns: 0, title: "Example Island".into() },
+        MetaEvent::SiteInfo {
+            domain: "en.wikipedia.org".into(),
+            language_code: Some("en".into()),
+        },
+        MetaEvent::Page {
+            id: 101,
+            ns: 0,
+            title: "Example Island".into(),
+        },
         rev(1001, None, 101, 87, 132, "2004-01-01T00:00:00Z"),
         rev(1002, Some(1001), 101, 310, 95, "2005-06-15T12:00:00Z"),
-        MetaEvent::Page { id: 102, ns: 1, title: "Talk:Example Island".into() },
+        MetaEvent::Page {
+            id: 102,
+            ns: 1,
+            title: "Talk:Example Island".into(),
+        },
         rev(2001, None, 102, 893, 59, "2006-02-02T00:00:00Z"),
-        MetaEvent::Page { id: 104, ns: 118, title: "Draft:Tab\tand\\backslash".into() },
+        MetaEvent::Page {
+            id: 104,
+            ns: 118,
+            title: "Draft:Tab\tand\\backslash".into(),
+        },
         rev(4001, None, 104, 1160, 52, "2020-05-05T05:05:05Z"),
         MetaEvent::Finalize,
     ]
@@ -80,18 +101,38 @@ fn writes_every_table_and_is_idempotent() {
     assert_eq!(row.get::<_, String>(4), "fixture.xml.mwrev.zst");
     assert_eq!((row.get::<_, i64>(5), row.get::<_, i64>(6)), (310, 95));
 
-    let title: String = c.query_one("SELECT page_title FROM page_metadata WHERE page_id = 104", &[]).unwrap().get(0);
+    let title: String = c
+        .query_one(
+            "SELECT page_title FROM page_metadata WHERE page_id = 104",
+            &[],
+        )
+        .unwrap()
+        .get(0);
     assert_eq!(title, "Draft:Tab\tand\\backslash", "COPY escaping");
-    let ns: i32 = c.query_one("SELECT page_namespace FROM page_metadata WHERE page_id = 102", &[]).unwrap().get(0);
+    let ns: i32 = c
+        .query_one(
+            "SELECT page_namespace FROM page_metadata WHERE page_id = 102",
+            &[],
+        )
+        .unwrap()
+        .get(0);
     assert_eq!(ns, 1);
     let (url, doc): (String, Option<i32>) = {
-        let r = c.query_one("SELECT url, instance_of_document FROM web_resources WHERE numeric_page_id = 101", &[]).unwrap();
+        let r = c
+            .query_one(
+                "SELECT url, instance_of_document FROM web_resources WHERE numeric_page_id = 101",
+                &[],
+            )
+            .unwrap();
         (r.get(0), r.get(1))
     };
     assert_eq!(url, "https://en.wikipedia.org/w/index.php?curid=101");
     assert!(doc.is_none(), "no documents are written any more");
 
-    assert_eq!(latest_timestamp(&cfg).as_deref(), Some("2020-05-05T05:05:05Z"));
+    assert_eq!(
+        latest_timestamp(&cfg).as_deref(),
+        Some("2020-05-05T05:05:05Z")
+    );
     let existing = existing_revisions(&cfg, &[1001, 1002, 9999]);
     assert!(existing.contains(&1001) && existing.contains(&1002) && !existing.contains(&9999));
 }

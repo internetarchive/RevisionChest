@@ -30,11 +30,43 @@ fn other<E: std::fmt::Display>(e: E) -> io::Error {
     io::Error::other(e.to_string())
 }
 
+/// GETs `url` with `params` and decodes JSON, retrying a response that does
+/// not decode (a truncated or HTML error body) with exponential backoff.
+fn request_with_retry(
+    client: &Client,
+    url: &str,
+    params: &[(&str, &str)],
+    max_retries: u32,
+) -> io::Result<Value> {
+    for attempt in 0..=max_retries {
+        let response = client.get(url).query(params).send().map_err(other)?;
+        match response.json::<Value>() {
+            Ok(v) => return Ok(v),
+            Err(e) if attempt < max_retries => {
+                let delay = std::time::Duration::from_secs(2u64.pow(attempt.min(20)));
+                log(&format!(
+                    "Failed to decode response (attempt {}/{}): {e}. Retrying in {delay:?}",
+                    attempt + 1,
+                    max_retries + 1
+                ));
+                std::thread::sleep(delay);
+            }
+            Err(e) => {
+                return Err(other(format!(
+                    "failed to decode response after {} attempts: {e}",
+                    max_retries + 1
+                )));
+            }
+        }
+    }
+    unreachable!("loop returns on the last attempt")
+}
+
 /// Runs one sync pass, or loops when `--ongoing`.
 ///
 /// `latest_recorded` is the newest revision timestamp already stored (from the
-/// Postgres or Parquet metadata); polling starts 24 hours before it, or 24
-/// hours ago when nothing is recorded, or at `--since`.
+/// Postgres or Parquet metadata); polling starts `--overlap` minutes (default
+/// 60) before it, or 24 hours ago when nothing is recorded, or at `--since`.
 pub fn run_sync(
     args: &SyncArgs,
     meta: &MetaSender,
@@ -49,6 +81,14 @@ pub fn run_sync(
                 .and_then(|v| v.parse().ok())
         })
         .unwrap_or(10);
+    let overlap_mins = args
+        .overlap
+        .or_else(|| {
+            std::env::var("SYNC_OVERLAP")
+                .ok()
+                .and_then(|v| v.parse().ok())
+        })
+        .unwrap_or(60);
 
     let mut cursor: DateTime<Utc> = match (&args.since, &latest_recorded) {
         (Some(s), _) => parse_ts(s).ok_or_else(|| {
@@ -72,7 +112,7 @@ pub fn run_sync(
                     ),
                 ));
             }
-            ts - Duration::hours(24)
+            ts - Duration::minutes(overlap_mins as i64)
         }
         (None, None) => Utc::now() - Duration::hours(24),
     };
@@ -124,13 +164,7 @@ pub fn run_sync(
             if let Some(c) = &rc_continue {
                 params.push(("rccontinue", c));
             }
-            let resp: Value = client
-                .get(&api)
-                .query(&params)
-                .send()
-                .map_err(other)?
-                .json()
-                .map_err(other)?;
+            let resp = request_with_retry(&client, &api, &params, args.max_retries)?;
 
             let Some(rcs) = resp["query"]["recentchanges"].as_array() else {
                 break;
@@ -186,6 +220,7 @@ pub fn run_sync(
                     &args.output_dir,
                     args.namespace.as_deref(),
                     meta,
+                    args.max_retries,
                 )?;
                 for &id in chunk {
                     processed.insert(id, ());
@@ -222,6 +257,7 @@ fn fetch_and_append(
     output_dir: &Path,
     namespaces: Option<&[i64]>,
     meta: &MetaSender,
+    max_retries: u32,
 ) -> io::Result<()> {
     if rev_ids.is_empty() {
         return Ok(());
@@ -231,22 +267,16 @@ fn fetch_and_append(
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("|");
-    let resp: Value = client
-        .get(api)
-        .query(&[
-            ("action", "query"),
-            ("prop", "revisions"),
-            ("revids", ids.as_str()),
-            ("rvprop", "ids|timestamp|user|content|userid|flags"),
-            ("rvslots", "main"),
-            ("format", "json"),
-            ("formatversion", "2"),
-        ])
-        .send()
-        .map_err(other)?
-        .json()
-        .map_err(other)?;
-
+    let params: Vec<(&str, &str)> = vec![
+        ("action", "query"),
+        ("prop", "revisions"),
+        ("revids", ids.as_str()),
+        ("rvprop", "ids|timestamp|user|content|userid|flags"),
+        ("rvslots", "main"),
+        ("format", "json"),
+        ("formatversion", "2"),
+    ];
+    let resp = request_with_retry(client, api, &params, max_retries)?;
     let by_day = parse_revisions(&resp, namespaces);
     append_revisions(by_day, output_dir, meta)
 }

@@ -89,8 +89,18 @@ pub struct SyncArgs {
     #[arg(long)]
     pub interval: Option<u64>,
 
+    /// Minutes of overlap before the latest recorded revision when resuming
+    /// (default: 60, or SYNC_OVERLAP); a fresh sync looks back 24 hours
+    #[arg(long)]
+    pub overlap: Option<u64>,
+
+    /// Retries, with exponential backoff, when an API response cannot be
+    /// decoded (default: 15)
+    #[arg(long, default_value = "15")]
+    pub max_retries: u32,
+
     /// Start from this timestamp (YYYY-MM-DDTHH:MM:SSZ) instead of the latest
-    /// recorded revision minus 24 hours
+    /// recorded revision minus the overlap
     #[arg(long)]
     pub since: Option<String>,
 

@@ -78,8 +78,11 @@ RevisionChest sync --domain en.wikipedia.org -o bundles/ --postgres --ongoing --
 `sync` polls `list=recentchanges`, fetches the content of revisions it has
 not recorded yet, and appends them to `bundles/recentchanges/<YYYY-MM-DD>.mwrev.zst`
 (one new zstd frame per batch). It resumes from the latest recorded
-revision timestamp minus 24 hours — read from Postgres, or from the Parquet
-file(s) — or from `--since`; with nothing recorded it starts 24 hours ago.
+revision timestamp minus an overlap (`--overlap` minutes, default 60, or
+`SYNC_OVERLAP`) — read from Postgres, or from the Parquet file(s) — or from
+`--since`; with nothing recorded it starts 24 hours ago. API responses that
+do not decode are retried with exponential backoff (`--max-retries`,
+default 15).
 Recent changes only reach back 30 days, so a store older than that must be
 rebuilt from a dump. With `--postgres`, revisions already in the database are
 skipped; otherwise an in-memory cache deduplicates within a run.
