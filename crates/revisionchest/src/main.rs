@@ -143,11 +143,15 @@ fn main() -> io::Result<()> {
                 let out = b.output_dir.as_deref().ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidInput, "-o is required with -d")
                 })?;
-                let files = build::list_dumps(dir)?;
+                let mut files = build::list_dumps(dir)?;
+                build::largest_first(&mut files);
                 let total = files.len();
                 let started = AtomicUsize::new(0);
                 let failures: Vec<(PathBuf, io::Error)> = files
-                    .into_par_iter()
+                    .into_iter()
+                    // A shared queue in that order: rayon would otherwise split
+                    // the Vec into per-thread ranges and ignore the ordering.
+                    .par_bridge()
                     .filter_map(|path| {
                         let n = started.fetch_add(1, Ordering::SeqCst) + 1;
                         build::build_file(

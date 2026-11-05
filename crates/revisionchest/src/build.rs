@@ -150,10 +150,42 @@ pub fn list_dumps(dir: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(entries)
 }
 
+/// Orders dump files largest first (compressed size as the proxy for work),
+/// so in a parallel run the longest files start first instead of setting the
+/// tail. The sort is stable: equal sizes, and files whose size can't be
+/// read (counted as 0), keep their order.
+pub fn largest_first(files: &mut [PathBuf]) {
+    files.sort_by_cached_key(|p| std::cmp::Reverse(fs::metadata(p).map_or(0, |m| m.len())));
+}
+
 #[cfg(test)]
 mod tests {
-    use super::bundle_name;
-    use std::path::Path;
+    use super::{bundle_name, largest_first};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn largest_first_orders_by_size_then_keeps_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let mk = |name: &str, len: usize| {
+            let p = dir.join(name);
+            std::fs::write(&p, vec![0u8; len]).unwrap();
+            p
+        };
+        let mut files = vec![
+            mk("a.7z", 10),
+            mk("b.7z", 30),
+            mk("c.7z", 10),
+            dir.join("missing.7z"),
+            mk("d.7z", 20),
+        ];
+        largest_first(&mut files);
+        let names: Vec<_> = files
+            .iter()
+            .map(|p: &PathBuf| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["b.7z", "d.7z", "a.7z", "c.7z", "missing.7z"]);
+    }
 
     #[test]
     fn names() {
