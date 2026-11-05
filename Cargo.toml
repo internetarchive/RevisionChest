@@ -23,7 +23,7 @@ revisionchest-meta = { path = "crates/revisionchest-meta" }
 quick-xml = "0.37"
 bzip2 = "0.4"
 flate2 = "1"
-sevenz-rust = "0.6"
+sevenz-rust2 = { version = "0.20.2", default-features = false }
 # bundles
 zstd = "0.13"
 # metadata sinks

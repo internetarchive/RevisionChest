@@ -12,7 +12,7 @@ publish = false
 quick-xml.workspace = true
 bzip2.workspace = true
 flate2.workspace = true
-sevenz-rust.workspace = true
+sevenz-rust2.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

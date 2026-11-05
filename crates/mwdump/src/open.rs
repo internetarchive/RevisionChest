@@ -50,7 +50,7 @@ pub fn open(path: &Path) -> Result<DumpReader<DumpStream>, DumpError> {
 
 /// The first file of a 7z archive, read on a worker thread.
 ///
-/// `sevenz-rust` hands the entry's reader to a callback rather than returning
+/// `sevenz-rust2` hands the entry's reader to a callback rather than returning
 /// it, so the decompression runs on its own thread and the bytes cross a
 /// bounded channel of 1 MiB chunks; back-pressure keeps at most a few
 /// chunks in flight.
@@ -63,8 +63,14 @@ struct SevenZStream {
 
 impl SevenZStream {
     fn open(path: &Path) -> Result<Self, DumpError> {
-        let mut archive = sevenz_rust::SevenZReader::open(path, sevenz_rust::Password::empty())
+        let mut archive = sevenz_rust2::ArchiveReader::open(path, sevenz_rust2::Password::empty())
             .map_err(|e| DumpError::SevenZ(e.to_string()))?;
+        // One decoder thread. sevenz-rust2 defaults to a multi-threaded LZMA2
+        // reader with one worker per CPU; Wikimedia's archives are a single
+        // LZMA2 block, so the workers only hand data to each other (futex and
+        // buffer churn: +9% wall, 3x RSS on a typical enwiki file), and
+        // `RevisionChest build` already runs one file per core.
+        archive.set_thread_count(1);
         let (tx, rx) = sync_channel::<io::Result<Vec<u8>>>(4);
         thread::Builder::new()
             .name("mwdump-7z".into())
