@@ -47,7 +47,8 @@ RevisionChest build enwiki-…-p1p857.bz2 -o bundles/
 RevisionChest build -d dumps/ -o bundles/ --parquet bundles/metadata.parquet
 ```
 
-Options: `--namespace 0,118` keeps only those namespaces; `--domain
+Options: `--namespace 0,118` keeps only those namespaces (other pages are
+skipped inside the XML reader, their text never decoded); `--domain
 en.wikipedia.org` overrides the domain read from the dump's `<siteinfo>`
 (needed for dumps without one).
 

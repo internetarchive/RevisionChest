@@ -4,6 +4,7 @@ use std::io::BufRead;
 
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event as XmlEvent};
+use quick_xml::name::QName;
 
 use crate::DumpError;
 
@@ -133,6 +134,10 @@ pub struct DumpReader<R: BufRead> {
     /// A `PageEnd` queued behind a `PageStart` for a page with no revisions.
     pending_end: Option<Event>,
     done: bool,
+    /// Namespaces to keep; `None` keeps every page.
+    namespaces: Option<Vec<i64>>,
+    /// The current page's `<ns>` is not wanted: skip to its `</page>`.
+    skip_page: bool,
 }
 
 impl<R: BufRead> DumpReader<R> {
@@ -154,7 +159,44 @@ impl<R: BufRead> DumpReader<R> {
             text: String::new(),
             pending_end: None,
             done: false,
+            namespaces: None,
+            skip_page: false,
         }
+    }
+
+    /// Keeps only pages in these namespaces. Any other page yields no events
+    /// at all (no `PageStart`, revisions or `PageEnd`), and its revisions are
+    /// skipped at the XML level, so their text is never decoded or copied
+    /// into strings. The decision is made at the page's `<ns>` element; a
+    /// page without one counts as namespace 0, as in [`PageHeader::ns`].
+    #[must_use]
+    pub fn with_namespaces(mut self, namespaces: &[i64]) -> Self {
+        self.namespaces = Some(namespaces.to_vec());
+        self
+    }
+
+    fn wanted(&self, ns: i64) -> bool {
+        self.namespaces
+            .as_ref()
+            .is_none_or(|list| list.contains(&ns))
+    }
+
+    /// Consumes the rest of the current page through its `</page>`, without
+    /// building any events; quick-xml clears `buf` after each XML event, so at
+    /// most one revision's raw text is held at a time.
+    fn skip_rest_of_page(&mut self) -> Result<(), DumpError> {
+        self.skip_page = false;
+        self.buf.clear();
+        self.reader
+            .read_to_end_into(QName(b"page"), &mut self.buf)
+            .map_err(|e| self.xml_err(e))?;
+        if self.path.last().map(String::as_str) == Some("page") {
+            self.path.pop();
+        }
+        self.page = None;
+        self.revision = None;
+        self.text.clear();
+        Ok(())
     }
 
     fn xml_err(&self, source: quick_xml::Error) -> DumpError {
@@ -298,7 +340,14 @@ impl<R: BufRead> DumpReader<R> {
             }
             // page header
             ("title", Some("page")) => self.pg(|p| p.title = text),
-            ("ns", Some("page")) => self.pg(|p| p.ns = text.trim().parse().unwrap_or(0)),
+            ("ns", Some("page")) => {
+                self.pg(|p| p.ns = text.trim().parse().unwrap_or(0));
+                let ns = self.page.as_ref().map_or(0, |p| p.ns);
+                // Only before any revision: `<ns>` precedes them in every export format.
+                if !self.page_sent && !self.wanted(ns) {
+                    self.skip_page = true;
+                }
+            }
             ("id", Some("page")) => self.pg(|p| p.id = text.trim().parse().unwrap_or(0)),
             // revision
             ("id", Some("revision")) => self.rv(|r| r.id = text.trim().parse().unwrap_or(0)),
@@ -365,6 +414,9 @@ impl<R: BufRead> DumpReader<R> {
             return Ok(Some(e));
         }
         loop {
+            if self.skip_page {
+                self.skip_rest_of_page()?;
+            }
             self.buf.clear();
             // Owned so the event does not keep `self.buf` borrowed while we mutate state.
             let ev = match self.reader.read_event_into(&mut self.buf) {

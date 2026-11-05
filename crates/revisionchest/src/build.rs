@@ -61,7 +61,12 @@ pub fn build_file(
     let allowed = |ns: i64| namespaces.is_none_or(|list| list.contains(&ns));
     let mut n_revisions = 0u64;
 
-    for event in open(input).map_err(io::Error::other)? {
+    let mut events = open(input).map_err(io::Error::other)?;
+    if let Some(list) = namespaces {
+        // Unwanted pages are skipped inside the reader, text undecoded.
+        events = events.with_namespaces(list);
+    }
+    for event in events {
         match event.map_err(io::Error::other)? {
             Event::SiteInfo(si) => {
                 if domain_override.is_none() {

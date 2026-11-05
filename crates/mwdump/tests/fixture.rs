@@ -122,6 +122,78 @@ fn all_formats_agree() {
     }
 }
 
+/// What a namespace filter must produce: the unfiltered events minus every
+/// event of a page outside `keep`.
+fn filtered_by_hand(events: &[Event], keep: &[i64]) -> Vec<Event> {
+    let mut out = Vec::new();
+    let mut in_kept_page = false;
+    for e in events {
+        match e {
+            Event::SiteInfo(_) => out.push(e.clone()),
+            Event::PageStart(p) => {
+                in_kept_page = keep.contains(&p.ns);
+                if in_kept_page {
+                    out.push(e.clone());
+                }
+            }
+            Event::Revision(_) | Event::PageEnd { .. } => {
+                if in_kept_page {
+                    out.push(e.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+fn read_filtered(name: &str, keep: &[i64]) -> Vec<Event> {
+    open(&fixture(name))
+        .unwrap()
+        .with_namespaces(keep)
+        .map(|e| e.unwrap())
+        .collect()
+}
+
+#[test]
+fn namespace_filter_drops_whole_pages_in_every_format() {
+    let all = read_all("fixture.xml");
+    for keep in [&[0][..], &[1], &[0, 118], &[118], &[], &[0, 1, 118]] {
+        let expected = filtered_by_hand(&all, keep);
+        for f in [
+            "fixture.xml",
+            "fixture.xml.bz2",
+            "fixture.xml.gz",
+            "fixture.xml.7z",
+        ] {
+            assert_eq!(read_filtered(f, keep), expected, "{f} keep={keep:?}");
+        }
+    }
+    // The fixture has pages in 0, 1 and 118, so [0] really removes something.
+    assert!(filtered_by_hand(&all, &[0]).len() < all.len());
+}
+
+#[test]
+fn namespace_filter_still_reports_a_dump_cut_inside_a_skipped_page() {
+    let xml = "<mediawiki><page><title>Talk:X</title><ns>1</ns><id>5</id><revision><id>1</id><text>unclosed";
+    let results: Vec<_> = mwdump::DumpReader::new(std::io::Cursor::new(xml))
+        .with_namespaces(&[0])
+        .collect();
+    assert!(results.iter().any(|r| r.is_err()), "{results:?}");
+}
+
+#[test]
+fn namespace_filter_resumes_after_a_skipped_page() {
+    let xml = r#"<mediawiki><page><title>Talk:A</title><ns>1</ns><id>1</id><revision><id>10</id><text>a &amp; &lt;b&gt;</text></revision></page><page><title>B</title><ns>0</ns><id>2</id><revision><id>20</id><text>b</text></revision></page></mediawiki>"#;
+    let events: Vec<Event> = mwdump::DumpReader::new(std::io::Cursor::new(xml))
+        .with_namespaces(&[0])
+        .map(|e| e.unwrap())
+        .collect();
+    assert_eq!(events.len(), 3, "{events:?}");
+    assert!(matches!(&events[0], Event::PageStart(p) if p.id == 2 && p.title == "B"));
+    assert!(matches!(&events[1], Event::Revision(r) if r.id == 20 && r.text == "b"));
+    assert!(matches!(&events[2], Event::PageEnd { id: 2 }));
+}
+
 #[test]
 fn page_without_revisions_still_starts_and_ends() {
     let xml = r#"<mediawiki xmlns="http://www.mediawiki.org/xml/export-0.11/"><page><title>Empty</title><ns>0</ns><id>5</id></page></mediawiki>"#;

@@ -25,6 +25,8 @@
 //! [`open`] picks the decompressor from the file extension (`.bz2`, `.gz`,
 //! `.7z`, or none); every path streams, including 7z. [`DumpReader::new`]
 //! takes any `BufRead` when the caller has its own source.
+//! [`DumpReader::with_namespaces`] drops pages outside a namespace list
+//! without decoding their revisions.
 
 #![forbid(unsafe_code)]
 
