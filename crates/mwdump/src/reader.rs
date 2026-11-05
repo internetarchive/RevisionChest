@@ -1,5 +1,6 @@
 //! The event reader.
 
+use std::borrow::Cow;
 use std::io::BufRead;
 
 use quick_xml::Reader;
@@ -116,6 +117,16 @@ pub enum Event {
         /// The page ID, matching the preceding [`Event::PageStart`].
         id: u64,
     },
+}
+
+/// What handling one XML event produced.
+// Returned by value and matched at once; boxing `Event` would only add an
+// allocation per revision.
+#[allow(clippy::large_enum_variant)]
+enum Step {
+    Continue,
+    Emit(Event),
+    Eof,
 }
 
 /// A streaming reader over a dump. Iterate it for [`Event`]s.
@@ -417,73 +428,85 @@ impl<R: BufRead> DumpReader<R> {
             if self.skip_page {
                 self.skip_rest_of_page()?;
             }
-            self.buf.clear();
-            // Owned so the event does not keep `self.buf` borrowed while we mutate state.
-            let ev = match self.reader.read_event_into(&mut self.buf) {
-                Ok(ev) => ev.into_owned(),
-                Err(e) => return Err(self.xml_err(e)),
+            // The buffer is taken out of `self` so the event can borrow it
+            // while the handler mutates `self`: no copy of each event (the
+            // revision text included), which `into_owned` used to make.
+            let mut buf = std::mem::take(&mut self.buf);
+            buf.clear();
+            let step = match self.reader.read_event_into(&mut buf) {
+                Ok(ev) => self.handle(ev),
+                Err(e) => Err(self.xml_err(e)),
             };
-            match ev {
-                XmlEvent::Start(e) => {
-                    if let Some(out) = self.on_start(&e, false)? {
-                        return Ok(Some(out));
-                    }
-                }
-                XmlEvent::Empty(e) => {
-                    let name = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
-                    let out = self.on_start(&e, true)?;
-                    // An empty element also "ends": `<text … />`, `<namespace key="0" />`.
-                    self.path.push(name.clone());
-                    let end = self.on_end(&name);
-                    self.path.pop();
-                    if let Some(out) = out.or(end) {
-                        return Ok(Some(out));
-                    }
-                }
-                XmlEvent::End(_) => {
-                    let Some(name) = self.path.pop() else {
-                        continue;
-                    };
-                    // on_end needs the element still on the path to find its parent.
-                    self.path.push(name.clone());
-                    let out = self.on_end(&name);
-                    self.path.pop();
-                    if let Some(out) = out {
-                        return Ok(Some(out));
-                    }
-                }
-                XmlEvent::Text(e) => {
-                    if self.wants_text() {
-                        let t = match e.unescape() {
-                            Ok(t) => t.into_owned(),
-                            Err(err) => return Err(self.xml_err(err)),
-                        };
-                        self.text.push_str(&t);
-                    }
-                }
-                XmlEvent::CData(e) => {
-                    if self.wants_text() {
-                        self.text.push_str(&String::from_utf8_lossy(&e));
-                    }
-                }
-                XmlEvent::Eof => {
-                    self.done = true;
-                    // quick-xml reports a truncated document as a plain end of
-                    // input; an element still open at EOF means the dump was cut.
-                    if let Some(open) = self.path.last() {
-                        return Err(DumpError::Malformed(format!(
-                            "unexpected end of input inside <{open}> at byte {}",
-                            self.reader.buffer_position()
-                        )));
-                    }
-                    return Ok(None);
-                }
-                XmlEvent::Decl(_)
-                | XmlEvent::PI(_)
-                | XmlEvent::Comment(_)
-                | XmlEvent::DocType(_) => {}
+            self.buf = buf;
+            match step? {
+                Step::Continue => {}
+                Step::Emit(e) => return Ok(Some(e)),
+                Step::Eof => return Ok(None),
             }
         }
+    }
+
+    fn handle(&mut self, ev: XmlEvent<'_>) -> Result<Step, DumpError> {
+        match ev {
+            XmlEvent::Start(e) => {
+                if let Some(out) = self.on_start(&e, false)? {
+                    return Ok(Step::Emit(out));
+                }
+            }
+            XmlEvent::Empty(e) => {
+                let name = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
+                let out = self.on_start(&e, true)?;
+                // An empty element also "ends": `<text … />`, `<namespace key="0" />`.
+                self.path.push(name.clone());
+                let end = self.on_end(&name);
+                self.path.pop();
+                if let Some(out) = out.or(end) {
+                    return Ok(Step::Emit(out));
+                }
+            }
+            XmlEvent::End(_) => {
+                let Some(name) = self.path.pop() else {
+                    return Ok(Step::Continue);
+                };
+                // on_end needs the element still on the path to find its parent.
+                self.path.push(name.clone());
+                let out = self.on_end(&name);
+                self.path.pop();
+                if let Some(out) = out {
+                    return Ok(Step::Emit(out));
+                }
+            }
+            XmlEvent::Text(e) => {
+                if self.wants_text() {
+                    match e.unescape() {
+                        // Entities were decoded into a new String: move it
+                        // in when it is the element's only text (the usual case).
+                        Ok(Cow::Owned(t)) if self.text.is_empty() => self.text = t,
+                        Ok(t) => self.text.push_str(&t),
+                        Err(err) => return Err(self.xml_err(err)),
+                    }
+                }
+            }
+            XmlEvent::CData(e) => {
+                if self.wants_text() {
+                    self.text.push_str(&String::from_utf8_lossy(&e));
+                }
+            }
+            XmlEvent::Eof => {
+                self.done = true;
+                // quick-xml reports a truncated document as a plain end of
+                // input; an element still open at EOF means the dump was cut.
+                if let Some(open) = self.path.last() {
+                    return Err(DumpError::Malformed(format!(
+                        "unexpected end of input inside <{open}> at byte {}",
+                        self.reader.buffer_position()
+                    )));
+                }
+                return Ok(Step::Eof);
+            }
+            XmlEvent::Decl(_) | XmlEvent::PI(_) | XmlEvent::Comment(_) | XmlEvent::DocType(_) => {}
+        }
+        Ok(Step::Continue)
     }
 
     /// Only leaf elements we read get their text accumulated; this keeps the
