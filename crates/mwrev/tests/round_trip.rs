@@ -131,3 +131,73 @@ fn reader_skips_junk_lines_and_tolerates_missing_text() {
     assert_eq!(items[0].1, "");
     assert_eq!(items[1].1, "x");
 }
+
+/// Pseudo-random lowercase text with newlines: compresses only by matching
+/// earlier copies of itself, not by its own redundancy.
+fn noise(len: usize, seed: u64) -> String {
+    let mut x = seed;
+    (0..len)
+        .map(|i| {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            if i % 80 == 79 {
+                '\n'
+            } else {
+                (b'a' + ((x >> 33) % 26) as u8) as char
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn repeated_revisions_megabytes_apart_are_matched() {
+    // Three revisions of the same 4 MiB text: each copy starts 4 MiB after
+    // the previous one, beyond a 2 MiB window but inside the 128 MiB one.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("long.mwrev.zst");
+    let text = noise(4 << 20, 42);
+    {
+        let mut w = BundleWriter::create(&path).unwrap();
+        for i in 1..=3u64 {
+            w.write_revision(&h(1, i, (i > 1).then_some(i - 1)), &text)
+                .unwrap();
+        }
+        w.finish().unwrap();
+    }
+    let size = std::fs::metadata(&path).unwrap().len();
+    // One copy alone compresses to ~2.5 MiB (log2(26) bits per letter); three
+    // unmatched copies would be ~7.5 MiB. Matched, the repeats cost almost nothing.
+    assert!(
+        size < 4 << 20,
+        "bundle is {size} bytes: repeats not matched"
+    );
+    let back: Vec<_> = BundleReader::open(&path)
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(back.len(), 3);
+    assert!(back.iter().all(|(_, t)| *t == text.trim_end_matches('\n')));
+}
+
+#[test]
+fn bundles_decode_within_zstds_default_window_limit() {
+    // The format promises that any zstd reader with default settings can
+    // read a bundle; 2^27 is libzstd's default decoder limit. Pin it here so
+    // a future WINDOW_LOG above 27 fails to compile rather than old readers.
+    const _: () = assert!(mwrev::WINDOW_LOG <= 27);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("w.mwrev.zst");
+    let text = noise(3 << 20, 7);
+    {
+        let mut w = BundleWriter::create(&path).unwrap();
+        w.write_revision(&h(1, 1, None), &text).unwrap();
+        w.write_revision(&h(1, 2, Some(1)), &text).unwrap();
+        w.finish().unwrap();
+    }
+    let mut dec = zstd::stream::read::Decoder::new(std::fs::File::open(&path).unwrap()).unwrap();
+    dec.window_log_max(27).unwrap();
+    let mut out = Vec::new();
+    std::io::Read::read_to_end(&mut dec, &mut out).unwrap();
+    assert!(out.len() > 2 * text.len());
+}

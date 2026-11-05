@@ -25,6 +25,13 @@
 //! offsets still count from the start of the file's decompressed content.
 //! [`BundleWriter::append`] keeps that invariant through a sidecar file.
 //!
+//! **Compression.** Frames are written at zstd's default level with
+//! long-distance matching and a 128 MiB window ([`WINDOW_LOG`] = 27), so a
+//! revision can reuse the previous revisions of its page even when they are
+//! megabytes long. That is zstd's default decoder limit: any zstd reader
+//! decodes a bundle with default settings, and bundles written before this
+//! (2 MiB window) read the same way.
+//!
 //! [`BundleReader`] streams a bundle back as `(header, text)` pairs; it is
 //! the reference parser for this format (the Python pipeline has an
 //! equivalent in `wcd_pipeline.extract`).
@@ -37,4 +44,6 @@ mod writer;
 
 pub use header::{HeaderError, RevisionHeader};
 pub use reader::{BundleReader, open_bundle, read_at};
-pub use writer::{BundleWriter, Location, SIDECAR_SUFFIX, sidecar_path as writer_sidecar_path};
+pub use writer::{
+    BundleWriter, Location, SIDECAR_SUFFIX, WINDOW_LOG, sidecar_path as writer_sidecar_path,
+};

@@ -13,6 +13,18 @@ use crate::RevisionHeader;
 /// decompressing the bundle.
 pub const SIDECAR_SUFFIX: &str = ".len";
 
+/// zstd window of a bundle frame, as a power of two: 2^27 = 128 MiB, with
+/// long-distance matching on.
+///
+/// A page's consecutive revisions repeat each other almost entirely, but a
+/// long article's revisions are larger than level 3's default 2 MiB window,
+/// so without this most of that repetition is out of reach (about half the
+/// bundle size on enwiki history). 27 is also zstd's default *decoder* limit,
+/// so these frames decode with any zstd reader's default settings; a larger
+/// window would need every reader to raise its limit, and measured no smaller.
+/// The cost is memory: up to 128 MiB of window per open encoder or decoder.
+pub const WINDOW_LOG: u32 = 27;
+
 /// Largest revision buffer kept between revisions.
 const SCRATCH_KEEP: usize = 16 << 20;
 
@@ -78,7 +90,9 @@ impl<W: Write> BundleWriter<W> {
     /// Wraps any writer; the zstd frame is finished by [`finish`](Self::finish)
     /// (or on drop, with errors ignored).
     pub fn new(inner: W) -> io::Result<Self> {
-        let enc = Encoder::new(inner, 0)?; // 0 = zstd's default level
+        let mut enc = Encoder::new(inner, 0)?; // 0 = zstd's default level
+        enc.long_distance_matching(true)?;
+        enc.window_log(WINDOW_LOG)?;
         Ok(Self {
             enc: Some(Counting {
                 inner: Sink::Zstd(enc),

@@ -118,7 +118,19 @@ Reading a revision back therefore means decompressing the bundle up to
 `offset_begin` — sequential, as the pipeline consumes bundles — rather than
 seeking; `mwrev::read_at` does that for tooling.
 
+**Compression.** Frames are zstd at the default level with long-distance
+matching and a 128 MiB window (`mwrev::WINDOW_LOG` = 27), so a revision can
+reuse its page's earlier revisions even when they run to megabytes; on
+enwiki history that roughly halves the bundles. 128 MiB is zstd's default
+decoder limit, so any zstd reader (`zstd -d`, python-zstandard, the `zstd`
+crate) reads a bundle with default settings, and older bundles (2 MiB
+window) read the same way. Budget up to 128 MiB per open encoder or decoder.
+
 ## Changes from 0.1
+
+- Bundles are written with zstd long-distance matching and a 128 MiB window
+  (about half the size on enwiki history). Readers need no change: 128 MiB
+  is zstd's default decoder limit, and 0.1 readers read new bundles.
 
 - Split into four crates; the binary's command line is unchanged except
   that `--db` (the SQLite index) is gone and `--postgres` is explicit.
