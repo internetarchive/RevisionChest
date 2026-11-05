@@ -55,7 +55,11 @@ pub fn build_file(
             let file: Box<dyn io::Write + Send> = Box::new(fs::File::create(dir.join(&bundle))?);
             BundleWriter::new(file)?
         }
-        None => BundleWriter::plain(Box::new(io::stdout())),
+        // Stdout is line-buffered; without this every line is a write(2).
+        None => BundleWriter::plain(Box::new(io::BufWriter::with_capacity(
+            1 << 20,
+            io::stdout(),
+        ))),
     };
 
     let allowed = |ns: i64| namespaces.is_none_or(|list| list.contains(&ns));

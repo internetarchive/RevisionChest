@@ -13,6 +13,9 @@ use crate::RevisionHeader;
 /// decompressing the bundle.
 pub const SIDECAR_SUFFIX: &str = ".len";
 
+/// Largest revision buffer kept between revisions.
+const SCRATCH_KEEP: usize = 16 << 20;
+
 /// Where a revision's text landed in a bundle (decompressed byte offsets).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Location {
@@ -31,6 +34,8 @@ pub struct BundleWriter<W: Write> {
     base: u64,
     /// Sidecar to update on finish, with the total decompressed length.
     sidecar: Option<PathBuf>,
+    /// One revision's bytes, assembled before a single write to the encoder.
+    scratch: Vec<u8>,
 }
 
 impl BundleWriter<File> {
@@ -81,6 +86,7 @@ impl<W: Write> BundleWriter<W> {
             }),
             base: 0,
             sidecar: None,
+            scratch: Vec::new(),
         })
     }
 
@@ -94,6 +100,7 @@ impl<W: Write> BundleWriter<W> {
             }),
             base: 0,
             sidecar: None,
+            scratch: Vec::new(),
         }
     }
 
@@ -105,16 +112,28 @@ impl<W: Write> BundleWriter<W> {
 
     /// Writes one revision: the header line, then each line of `text`
     /// prefixed with a space. Returns where the text lines landed.
+    ///
+    /// The revision is assembled in a reusable buffer and handed to the
+    /// encoder in one write: per-line writes cost a zstd streaming call each.
     pub fn write_revision(&mut self, header: &RevisionHeader, text: &str) -> io::Result<Location> {
         let enc = self.enc.as_mut().expect("writer already finished");
-        writeln!(enc, "{header}")?;
-        let offset_begin = self.base + enc.offset;
+        let buf = &mut self.scratch;
+        buf.clear();
+        writeln!(buf, "{header}")?;
+        let header_len = buf.len();
+        buf.reserve(text.len() + text.len() / 32 + 2);
         for line in text.lines() {
-            enc.write_all(b" ")?;
-            enc.write_all(line.as_bytes())?;
-            enc.write_all(b"\n")?;
+            buf.push(b' ');
+            buf.extend_from_slice(line.as_bytes());
+            buf.push(b'\n');
         }
-        let length = self.base + enc.offset - offset_begin;
+        let offset_begin = self.base + enc.offset + header_len as u64;
+        let length = (buf.len() - header_len) as u64;
+        enc.write_all(buf)?;
+        // Don't keep a buffer sized for one huge revision for the rest of the run.
+        if buf.capacity() > SCRATCH_KEEP {
+            *buf = Vec::new();
+        }
         Ok(Location {
             offset_begin,
             length,
