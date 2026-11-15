@@ -22,7 +22,8 @@ pub enum Commands {
 #[derive(Parser, Debug, Clone)]
 pub struct MetaArgs {
     /// Write metadata to this Parquet file (for `build`), or into this
-    /// directory as one file per run (for `sync`, when the path is a directory)
+    /// directory as one file per run (for `sync`, when the path is a directory;
+    /// `sync --ongoing` writes one file per cycle and requires a directory)
     #[arg(long)]
     pub parquet: Option<PathBuf>,
 

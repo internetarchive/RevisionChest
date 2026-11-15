@@ -72,14 +72,19 @@ fn postgres_config(meta: &MetaArgs) -> Option<()> {
     None
 }
 
-/// Parquet target for a run: a file as given, or a per-run file inside a
-/// directory (`sync` keeps every run's metadata that way).
+/// Parquet target for a run: a file as given, or a new per-run file inside a
+/// directory (`sync` keeps every run's — and every `--ongoing` cycle's —
+/// metadata that way). An existing file in the directory is never reused.
 fn parquet_target(path: &Path) -> PathBuf {
     if path.is_dir() {
-        path.join(format!(
-            "revisionchest-{}.parquet",
-            Local::now().format("%Y%m%dT%H%M%S")
-        ))
+        let stem = format!("revisionchest-{}", Local::now().format("%Y%m%dT%H%M%S"));
+        let mut target = path.join(format!("{stem}.parquet"));
+        let mut n = 1;
+        while target.exists() {
+            target = path.join(format!("{stem}-{n}.parquet"));
+            n += 1;
+        }
+        target
     } else {
         path.to_path_buf()
     }
@@ -218,17 +223,42 @@ fn main() -> io::Result<()> {
                 }
             }
 
-            let sink = make_sink(&s.meta)?;
-            let (meta, handle) = revisionchest_meta::spawn(sink, 10_000);
-            meta.send(MetaEvent::SiteInfo {
-                domain: s.domain.clone(),
-                language_code: None,
-            });
-            let result = sync::run_sync(&s, &meta, latest, already);
-            drop(meta);
-            let sink_result = handle.join();
-            result?;
-            sink_result.map_err(io::Error::other)?;
+            // Each cycle gets its own sink, finished before the next poll, so an
+            // --ongoing sync leaves complete metadata on disk after every cycle
+            // (a Parquet file has no footer, and cannot be read, until closed).
+            // A single --parquet file would be truncated by every cycle.
+            if s.ongoing {
+                if let Some(p) = s.meta.parquet.as_ref().filter(|p| !p.is_dir()) {
+                    eprintln!(
+                        "error: --ongoing writes one metadata file per cycle; --parquet must be an existing directory, not {}",
+                        p.display()
+                    );
+                    std::process::exit(2);
+                }
+            }
+            let mut syncer = sync::Syncer::new(&s, latest, already)?;
+            loop {
+                let sink = make_sink(&s.meta)?;
+                let (meta, handle) = revisionchest_meta::spawn(sink, 10_000);
+                meta.send(MetaEvent::SiteInfo {
+                    domain: s.domain.clone(),
+                    language_code: None,
+                });
+                let result = syncer.cycle(&meta);
+                drop(meta);
+                let sink_result = handle.join();
+                result?;
+                sink_result.map_err(io::Error::other)?;
+
+                if !s.ongoing {
+                    break;
+                }
+                let interval = sync::interval_mins(&s);
+                log(&format!(
+                    "Sync cycle complete. Sleeping for {interval} minutes"
+                ));
+                std::thread::sleep(std::time::Duration::from_secs(interval * 60));
+            }
         }
     }
     Ok(())
@@ -247,5 +277,32 @@ fn latest_parquet_timestamp(path: &Path) -> Option<String> {
             .max()
     } else {
         latest_timestamp(path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parquet_target_in_a_directory_never_reuses_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut seen = HashSet::new();
+        for _ in 0..3 {
+            // Three runs within the same second: each must get a new file.
+            let t = parquet_target(dir.path());
+            assert!(!t.exists(), "{} already exists", t.display());
+            assert_eq!(t.parent(), Some(dir.path()));
+            assert_eq!(t.extension().and_then(|e| e.to_str()), Some("parquet"));
+            std::fs::write(&t, b"").unwrap();
+            assert!(seen.insert(t));
+        }
+    }
+
+    #[test]
+    fn parquet_target_for_a_file_is_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("meta.parquet");
+        assert_eq!(parquet_target(&file), file);
     }
 }

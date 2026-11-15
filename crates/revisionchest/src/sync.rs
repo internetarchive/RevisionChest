@@ -62,88 +62,125 @@ fn request_with_retry(
     unreachable!("loop returns on the last attempt")
 }
 
-/// Runs one sync pass, or loops when `--ongoing`.
-///
-/// `latest_recorded` is the newest revision timestamp already stored (from the
-/// Postgres or Parquet metadata); polling starts `--overlap` minutes (default
-/// 60) before it, or 24 hours ago when nothing is recorded, or at `--since`.
-pub fn run_sync(
-    args: &SyncArgs,
-    meta: &MetaSender,
-    latest_recorded: Option<String>,
-    already: AlreadyRecorded,
-) -> io::Result<()> {
-    let interval_mins = args
-        .interval
+/// Minutes between polls when `--ongoing`: `--interval`, else `SYNC_INTERVAL`, else 10.
+pub fn interval_mins(args: &SyncArgs) -> u64 {
+    args.interval
         .or_else(|| {
             std::env::var("SYNC_INTERVAL")
                 .ok()
                 .and_then(|v| v.parse().ok())
         })
-        .unwrap_or(10);
-    let overlap_mins = args
-        .overlap
-        .or_else(|| {
-            std::env::var("SYNC_OVERLAP")
-                .ok()
-                .and_then(|v| v.parse().ok())
-        })
-        .unwrap_or(60);
+        .unwrap_or(10)
+}
 
-    let mut cursor: DateTime<Utc> = match (&args.since, &latest_recorded) {
-        (Some(s), _) => parse_ts(s).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("--since {s:?} is not a timestamp"),
-            )
-        })?,
-        (None, Some(ts)) => {
-            let ts = parse_ts(ts).ok_or_else(|| {
+/// The state a sync carries from one cycle to the next: where to poll from,
+/// the HTTP client, and which revisions this process already fetched.
+///
+/// A cycle ([`Syncer::cycle`]) polls recent changes from the cursor up to now
+/// and fetches the new revisions. The caller gives each cycle its own
+/// metadata sink and finishes it when the cycle returns, so that under
+/// `--ongoing` every cycle's metadata is complete on disk (a Parquet file is
+/// only readable once its footer is written) before the next poll starts.
+pub struct Syncer<'a> {
+    args: &'a SyncArgs,
+    cursor: DateTime<Utc>,
+    client: Client,
+    api: String,
+    namespaces: Option<String>,
+    processed: Cache<u64, ()>,
+    already: AlreadyRecorded,
+}
+
+impl<'a> Syncer<'a> {
+    /// Sets up a sync.
+    ///
+    /// `latest_recorded` is the newest revision timestamp already stored (from the
+    /// Postgres or Parquet metadata); polling starts `--overlap` minutes (default
+    /// 60) before it, or 24 hours ago when nothing is recorded, or at `--since`.
+    pub fn new(
+        args: &'a SyncArgs,
+        latest_recorded: Option<String>,
+        already: AlreadyRecorded,
+    ) -> io::Result<Self> {
+        let overlap_mins = args
+            .overlap
+            .or_else(|| {
+                std::env::var("SYNC_OVERLAP")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+            })
+            .unwrap_or(60);
+
+        let cursor: DateTime<Utc> = match (&args.since, &latest_recorded) {
+            (Some(s), _) => parse_ts(s).ok_or_else(|| {
                 io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("stored timestamp {ts:?} is not a timestamp"),
-                )
-            })?;
-            if Utc::now() - ts > Duration::days(30) {
-                return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!(
-                        "the most recent recorded revision ({ts}) is more than 30 days old; recent changes only go back 30 days — rebuild from a dump instead"
-                    ),
-                ));
+                    format!("--since {s:?} is not a timestamp"),
+                )
+            })?,
+            (None, Some(ts)) => {
+                let ts = parse_ts(ts).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("stored timestamp {ts:?} is not a timestamp"),
+                    )
+                })?;
+                if Utc::now() - ts > Duration::days(30) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "the most recent recorded revision ({ts}) is more than 30 days old; recent changes only go back 30 days — rebuild from a dump instead"
+                        ),
+                    ));
+                }
+                ts - Duration::minutes(overlap_mins as i64)
             }
-            ts - Duration::minutes(overlap_mins as i64)
-        }
-        (None, None) => Utc::now() - Duration::hours(24),
-    };
+            (None, None) => Utc::now() - Duration::hours(24),
+        };
 
-    let user_agent = format!(
-        "{}/{} ({})",
-        std::env::var("UA_APP_NAME").unwrap_or_else(|_| "RevisionChest".into()),
-        std::env::var("UA_APP_VERSION").unwrap_or_else(|_| env!("CARGO_PKG_VERSION").into()),
-        std::env::var("UA_CONTACT_INFO")
-            .or_else(|_| std::env::var("CONTACT_EMAIL"))
-            .unwrap_or_else(|_| "https://github.com/internetarchive/RevisionChest".into())
-    );
-    let client = Client::builder()
-        .user_agent(user_agent)
-        .build()
-        .map_err(other)?;
-    let api = format!("https://{}/w/api.php", args.domain);
-    let namespaces = args.namespace.as_ref().map(|ns| {
-        ns.iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("|")
-    });
-    let processed: Cache<u64, ()> = Cache::builder()
-        .time_to_live(std::time::Duration::from_secs(25 * 3600))
-        .build();
+        let user_agent = format!(
+            "{}/{} ({})",
+            std::env::var("UA_APP_NAME").unwrap_or_else(|_| "RevisionChest".into()),
+            std::env::var("UA_APP_VERSION").unwrap_or_else(|_| env!("CARGO_PKG_VERSION").into()),
+            std::env::var("UA_CONTACT_INFO")
+                .or_else(|_| std::env::var("CONTACT_EMAIL"))
+                .unwrap_or_else(|_| "https://github.com/internetarchive/RevisionChest".into())
+        );
+        let client = Client::builder()
+            .user_agent(user_agent)
+            .build()
+            .map_err(other)?;
+        let api = format!("https://{}/w/api.php", args.domain);
+        let namespaces = args.namespace.as_ref().map(|ns| {
+            ns.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("|")
+        });
+        let processed: Cache<u64, ()> = Cache::builder()
+            .time_to_live(std::time::Duration::from_secs(25 * 3600))
+            .build();
 
-    loop {
+        Ok(Self {
+            args,
+            cursor,
+            client,
+            api,
+            namespaces,
+            processed,
+            already,
+        })
+    }
+
+    /// One pass: polls recent changes from the cursor until the feed is
+    /// exhausted, fetching and appending the revisions not yet recorded, and
+    /// reporting them to `meta`. The cursor and the fetched-revision cache
+    /// carry over to the next cycle.
+    pub fn cycle(&mut self, meta: &MetaSender) -> io::Result<()> {
+        let args = self.args;
         let mut rc_continue: Option<String> = None;
         loop {
-            let start = cursor.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+            let start = self.cursor.format("%Y-%m-%dT%H:%M:%SZ").to_string();
             log(&format!(
                 "Polling recent changes from {} (starting from {start})",
                 args.domain
@@ -158,13 +195,13 @@ pub fn run_sync(
                 ("format", "json"),
                 ("formatversion", "2"),
             ];
-            if let Some(ns) = &namespaces {
+            if let Some(ns) = &self.namespaces {
                 params.push(("rcnamespace", ns));
             }
             if let Some(c) = &rc_continue {
                 params.push(("rccontinue", c));
             }
-            let resp = request_with_retry(&client, &api, &params, args.max_retries)?;
+            let resp = request_with_retry(&self.client, &self.api, &params, args.max_retries)?;
 
             let Some(rcs) = resp["query"]["recentchanges"].as_array() else {
                 break;
@@ -177,7 +214,7 @@ pub fn run_sync(
                 .and_then(|rc| rc["timestamp"].as_str())
                 .and_then(parse_ts)
             {
-                cursor = ts;
+                self.cursor = ts;
             }
 
             for rc in rcs {
@@ -203,9 +240,9 @@ pub fn run_sync(
             let wanted: Vec<u64> = rcs
                 .iter()
                 .filter_map(|rc| rc["revid"].as_u64())
-                .filter(|id| !processed.contains_key(id))
+                .filter(|id| !self.processed.contains_key(id))
                 .collect();
-            let recorded = already(&wanted);
+            let recorded = (self.already)(&wanted);
             let wanted: Vec<u64> = wanted
                 .into_iter()
                 .filter(|id| !recorded.contains(id))
@@ -214,8 +251,8 @@ pub fn run_sync(
             for chunk in wanted.chunks(50) {
                 log(&format!("Fetching content for {} revisions", chunk.len()));
                 fetch_and_append(
-                    &client,
-                    &api,
+                    &self.client,
+                    &self.api,
                     chunk,
                     &args.output_dir,
                     args.namespace.as_deref(),
@@ -223,7 +260,7 @@ pub fn run_sync(
                     args.max_retries,
                 )?;
                 for &id in chunk {
-                    processed.insert(id, ());
+                    self.processed.insert(id, ());
                 }
             }
             meta.send(MetaEvent::Finalize);
@@ -233,16 +270,8 @@ pub fn run_sync(
                 None => break,
             }
         }
-
-        if !args.ongoing {
-            break;
-        }
-        log(&format!(
-            "Sync cycle complete. Sleeping for {interval_mins} minutes"
-        ));
-        std::thread::sleep(std::time::Duration::from_secs(interval_mins * 60));
+        Ok(())
     }
-    Ok(())
 }
 
 struct Fetched {

@@ -88,6 +88,13 @@ Recent changes only reach back 30 days, so a store older than that must be
 rebuilt from a dump. With `--postgres`, revisions already in the database are
 skipped; otherwise an in-memory cache deduplicates within a run.
 
+Each cycle (one poll, or every poll of an `--ongoing` sync) writes its
+metadata through its own sink, finished before the next poll: with a
+`--parquet` directory that is one closed, readable
+`revisionchest-<time>.parquet` per cycle, so metadata is never held in a file
+that is only completed when the process exits. `--ongoing` therefore needs
+`--parquet` to be an existing directory, not a single file.
+
 Set a User-Agent contact for the Wikimedia API policy: `UA_CONTACT_INFO`
 (or `CONTACT_EMAIL`), optionally `UA_APP_NAME` / `UA_APP_VERSION`, in the
 environment or `.env`.
