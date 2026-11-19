@@ -2,9 +2,11 @@
 target/
 *.7z
 *.bz2
+*.gz
 *.zst
-*.db
-*.db-shm
-*.db-wal
+*.len
+*.parquet
 .DS_Store
 .env
+# test fixtures are the exception
+!crates/mwdump/tests/fixtures/*

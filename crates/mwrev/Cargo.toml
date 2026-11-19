@@ -1,0 +1,16 @@
+[package]
+name = "mwrev"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The .mwrev.zst revision bundle format: a zstd stream of '# page_id=… rev_id=…' header lines followed by space-prefixed text lines; writer with byte offsets, streaming reader"
+publish = false
+
+[dependencies]
+zstd.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

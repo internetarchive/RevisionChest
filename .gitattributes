@@ -1,0 +1,3 @@
+# Test dumps are byte-exact fixtures: fixture.xml carries CRLF inside revision text
+# (rev 1005), which line-ending normalization (core.autocrlf, text=auto) would strip.
+crates/mwdump/tests/fixtures/** -text
