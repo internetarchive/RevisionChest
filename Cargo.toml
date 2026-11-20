@@ -23,7 +23,7 @@ revisionchest-meta = { path = "crates/revisionchest-meta" }
 
 # dump reading
 quick-xml = "0.42"
-bzip2 = "0.4"
+bzip2 = "0.6"
 flate2 = "1"
 sevenz-rust2 = { version = "0.20.2", default-features = false }
 # bundles
