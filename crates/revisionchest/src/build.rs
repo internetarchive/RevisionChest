@@ -119,7 +119,8 @@ pub fn build_file(
                     timestamp: r.timestamp,
                 });
             }
-            Event::PageEnd { .. } => {}
+            // Page ends, and any kind of event a later mwdump adds.
+            _ => {}
         }
     }
     writer.finish()?;

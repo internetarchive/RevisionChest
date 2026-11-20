@@ -42,6 +42,7 @@ fn round_trip(path: &str, pages_expected: usize, revisions_expected: usize) {
             Event::PageStart(p) => w.open_page(p).unwrap(),
             Event::Revision(r) => w.revision(r).unwrap(),
             Event::PageEnd { .. } => w.close_page().unwrap(),
+            other => panic!("unexpected event {other:?}"),
         }
     }
     let written = w.finish().unwrap();

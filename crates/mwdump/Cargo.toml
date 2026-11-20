@@ -6,7 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Streaming reader and writer for MediaWiki XML dumps (pages-meta-history and friends): one event per page start, revision and page end, from .xml, .bz2, .gz or .7z, with hidden parts and content slots"
-publish = false
+keywords = ["mediawiki", "wikipedia", "xml", "dump"]
+categories = ["parser-implementations", "encoding"]
 
 [dependencies]
 quick-xml.workspace = true

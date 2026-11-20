@@ -18,6 +18,7 @@ use crate::{Location, RevisionHeader};
 
 /// What follows a committed prefix of a bundle.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Tail {
     /// Compressed length of the bundle through its last complete frame.
     pub compressed_len: u64,

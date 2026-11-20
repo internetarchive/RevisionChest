@@ -129,10 +129,10 @@ fn hidden_parts_are_flagged() {
     assert_eq!(text_hidden.ip.as_deref(), Some("127.0.0.1"));
     assert_eq!(text_hidden.text, "");
     assert_eq!(text_hidden.sha1, None, "an empty <sha1 /> is none");
-    assert!(events.contains(&Event::PageStart(PageHeader {
-        id: 40,
-        ns: 120,
-        title: "Item:Q12".into(),
-        redirect: Some("Item:Q6".into()),
-    })));
+    let mut q12 = PageHeader::default();
+    q12.id = 40;
+    q12.ns = 120;
+    q12.title = "Item:Q12".into();
+    q12.redirect = Some("Item:Q6".into());
+    assert!(events.contains(&Event::PageStart(q12)));
 }
