@@ -501,12 +501,14 @@ impl<'a> Syncer<'a> {
     }
 
     fn save(&self, pending_parquet: Option<&Path>) -> io::Result<()> {
+        // Absolute, so a restart from another working directory still finds the file.
+        let pending_parquet = pending_parquet.map(std::path::absolute).transpose()?;
         let pos = Position {
             time: self.poller.time,
             cont: self.poller.cont.clone(),
             seen: self.poller.seen(),
             bundles: self.committed.clone(),
-            pending_parquet: pending_parquet.map(Path::to_path_buf),
+            pending_parquet,
         };
         write_atomic(&self.dir.join(POSITION_FILE), &pos.to_json())
     }
