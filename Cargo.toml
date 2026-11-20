@@ -27,6 +27,8 @@ flate2 = "1"
 sevenz-rust2 = { version = "0.20.2", default-features = false }
 # bundles
 zstd = "0.13"
+# MediaWiki's base-36 SHA-1 of a revision, written by mwdump's writer
+sha1 = "0.11"
 # metadata sinks
 parquet = "53.0"
 arrow = "53.0"

@@ -27,14 +27,55 @@
 //! takes any `BufRead` when the caller has its own source.
 //! [`DumpReader::with_namespaces`] drops pages outside a namespace list
 //! without decoding their revisions.
+//!
+//! A revision carries what the export hid (text, comment, contributor) and,
+//! for a dump in schema 0.11, its further content slots. [`Writer`] writes
+//! the same shape back out, page by page and revision by revision, as
+//! MediaWiki 1.43's `XmlDumpWriter` writes it.
 
 #![forbid(unsafe_code)]
 
 mod open;
 mod reader;
+mod writer;
 
 pub use open::{open, open_path};
-pub use reader::{DumpReader, Event, Namespace, PageHeader, Revision, SiteInfo};
+pub use reader::{DumpReader, Event, Namespace, PageHeader, Revision, SiteInfo, Slot};
+pub use writer::Writer;
+
+/// The export schema version [`Writer`] writes.
+pub const SCHEMA_VERSION: &str = "0.11";
+/// The XML namespace of that schema.
+pub const SCHEMA_NAMESPACE: &str = "http://www.mediawiki.org/xml/export-0.11/";
+
+/// MediaWiki's `sha1` of a revision's text: the SHA-1 digest in base 36, left-padded with
+/// zeros to 31 characters, as `Wikimedia\base_convert` writes it (`rev_sha1`).
+#[must_use]
+pub fn sha1_base36(text: &str) -> String {
+    use sha1::{Digest as _, Sha1};
+    base36(&Sha1::digest(text.as_bytes()))
+}
+
+/// A big-endian byte string as a base-36 number, 31 digits wide.
+fn base36(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut number: Vec<u8> = bytes.to_vec();
+    let mut out = Vec::with_capacity(31);
+    while number.iter().any(|&b| b != 0) {
+        let mut carry = 0u32;
+        for b in &mut number {
+            let value = (carry << 8) | u32::from(*b);
+            *b = u8::try_from(value / 36).unwrap_or(0);
+            carry = value % 36;
+        }
+        out.push(DIGITS[carry as usize]);
+    }
+    while out.len() < 31 {
+        out.push(b'0');
+    }
+    out.reverse();
+    String::from_utf8(out).unwrap_or_default()
+}
 
 /// Why a dump could not be read.
 #[derive(Debug, thiserror::Error)]
@@ -57,4 +98,22 @@ pub enum DumpError {
     /// The 7z archive could not be opened or read.
     #[error("7z: {0}")]
     SevenZ(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sha1_as_mediawiki_writes_it() {
+        // Librarybase's `User:Database import`, revision 1096.
+        assert_eq!(
+            sha1_base36(
+                "Edits attributed to this account have been imported using BatchIngestion."
+            ),
+            "jvd0zndg8rmpjno1ro5g8a78mno8uu3"
+        );
+        assert_eq!(sha1_base36("").len(), 31);
+        assert_eq!(base36(&[0; 20]), "0".repeat(31));
+    }
 }
