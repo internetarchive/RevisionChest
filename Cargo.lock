@@ -1457,7 +1457,7 @@ dependencies = [
 
 [[package]]
 name = "mwdump"
-version = "0.2.0"
+version = "0.1.0"
 dependencies = [
  "bzip2",
  "flate2",
@@ -1469,7 +1469,7 @@ dependencies = [
 
 [[package]]
 name = "mwrev"
-version = "0.2.0"
+version = "0.1.0"
 dependencies = [
  "tempfile",
  "thiserror",

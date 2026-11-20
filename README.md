@@ -22,6 +22,12 @@ dumps and bundles the same way.
 The crates depend only downwards: `revisionchest` → `mwdump`, `mwrev`,
 `revisionchest-meta`; the three libraries are independent of each other.
 
+`mwdump` and `mwrev` are the crates published to crates.io (`mwdump` not
+yet: it is still `publish = false`). They carry their own
+versions, starting at 0.1.0, which follow semver for each crate's own API.
+The binary and `revisionchest-meta` are not published and share the
+workspace version; "Changes from 0.1" below is about them.
+
 ## Building
 
 Stable Rust ≥ 1.85 (edition 2024).
@@ -146,6 +152,11 @@ window) read the same way. Budget up to 128 MiB per open encoder or decoder.
 - A revision whose text the wiki has hidden carries ` text_hidden=1` on its
   bundle header (`RevisionHeader::text_hidden`); it used to be
   indistinguishable from a blank revision. Bundles are otherwise unchanged.
+  The marker is 14 bytes, so in a bundle rebuilt from the same dump the
+  text of that revision and of every later one starts 14 bytes further on,
+  and `offset_begin` in the metadata moves with it. Bundles and metadata
+  from one build agree; do not pair metadata from a 0.1 build with bundles
+  rebuilt by this one, or the reverse.
 - Split into four crates; the binary's command line is unchanged except
   that `--db` (the SQLite index) is gone and `--postgres` is explicit.
 - `.7z` dumps are streamed; previously the whole decompressed dump was read
