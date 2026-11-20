@@ -262,6 +262,25 @@ fn a_restart_neither_misses_nor_repeats_a_revision() {
 }
 
 #[test]
+fn the_pending_parquet_file_is_recorded_by_its_absolute_path() {
+    // A restart from another working directory must still find the file to remove it
+    // (found in a live run against test.wikipedia.org on 2026-11-20).
+    let dir = tempfile::tempdir().unwrap();
+    let a = args(dir.path(), &[]);
+    let wiki = FakeWiki::default();
+    let now = Arc::new(AtomicU64::new(T0 + 600));
+    let s = syncer(&a, &wiki, &now).unwrap();
+    s.begin(Some(Path::new("meta/cycle.parquet"))).unwrap();
+    let pos: Value = serde_json::from_slice(
+        &fs::read(dir.path().join("recentchanges").join(POSITION_FILE)).unwrap(),
+    )
+    .unwrap();
+    let recorded = Path::new(pos["pending_parquet"].as_str().unwrap());
+    assert!(recorded.is_absolute(), "{}", recorded.display());
+    assert!(recorded.ends_with("meta/cycle.parquet"));
+}
+
+#[test]
 fn a_duplicate_row_and_a_late_one_are_each_written_once() {
     let dir = tempfile::tempdir().unwrap();
     let a = args(dir.path(), &[]);
