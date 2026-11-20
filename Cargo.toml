@@ -18,6 +18,7 @@ repository = "https://github.com/internetarchive/RevisionChest"
 [workspace.dependencies]
 mwdump = { path = "crates/mwdump" }
 mwrev = { path = "crates/mwrev" }
+mwrecent = { path = "crates/mwrecent" }
 revisionchest-meta = { path = "crates/revisionchest-meta" }
 
 # dump reading

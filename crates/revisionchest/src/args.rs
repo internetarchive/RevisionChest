@@ -90,9 +90,32 @@ pub struct SyncArgs {
     #[arg(long)]
     pub interval: Option<u64>,
 
-    /// Minutes of overlap before the latest recorded revision when resuming
-    /// (default: 60, or SYNC_OVERLAP); a fresh sync looks back 24 hours
+    /// Seconds within which the newest changes are read by time, backed off
+    /// ten seconds, since a wiki can commit a change late (default: 120)
     #[arg(long)]
+    pub settle: Option<u64>,
+
+    /// Seconds behind the newest change the tail pass re-reads once caught
+    /// up, for changes committed late; also how far before the newest
+    /// recorded revision a sync without a position starts (default: 900; 0
+    /// turns the tail pass off)
+    #[arg(long)]
+    pub tail: Option<u64>,
+
+    /// Resume even when the position is older than the oldest change the
+    /// wiki still has: start from that change and record the gap in
+    /// recentchanges/gaps.jsonl (without it, sync refuses to start)
+    #[arg(long)]
+    pub accept_gap: bool,
+
+    /// Days the wiki keeps recent changes ($wgRCMaxAge): 30 on Wikimedia
+    /// wikis, MediaWiki's default 90. A position within this window of now
+    /// is never a gap, however old the wiki's oldest change (default: 30)
+    #[arg(long, default_value = "30")]
+    pub rc_max_age: u64,
+
+    /// Replaced by the committed position and --tail; accepted and ignored
+    #[arg(long, hide = true)]
     pub overlap: Option<u64>,
 
     /// Retries, with exponential backoff, when an API response cannot be
@@ -100,8 +123,9 @@ pub struct SyncArgs {
     #[arg(long, default_value = "15")]
     pub max_retries: u32,
 
-    /// Start from this timestamp (YYYY-MM-DDTHH:MM:SSZ) instead of the latest
-    /// recorded revision minus the overlap
+    /// Start from this timestamp (YYYY-MM-DDTHH:MM:SSZ) when there is no
+    /// committed position (recentchanges/position.json), instead of the latest
+    /// recorded revision less --tail
     #[arg(long)]
     pub since: Option<String>,
 

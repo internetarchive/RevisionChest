@@ -43,6 +43,7 @@
 
 mod header;
 mod reader;
+pub mod recover;
 mod writer;
 
 pub use header::{HeaderError, RevisionHeader};

@@ -83,17 +83,41 @@ RevisionChest sync --domain en.wikipedia.org -o bundles/ --namespace 0 --parquet
 RevisionChest sync --domain en.wikipedia.org -o bundles/ --postgres --ongoing --interval 5
 ```
 
-`sync` polls `list=recentchanges`, fetches the content of revisions it has
-not recorded yet, and appends them to `bundles/recentchanges/<YYYY-MM-DD>.mwrev.zst`
-(one new zstd frame per batch). It resumes from the latest recorded
-revision timestamp minus an overlap (`--overlap` minutes, default 60, or
-`SYNC_OVERLAP`) — read from Postgres, or from the Parquet file(s) — or from
-`--since`; with nothing recorded it starts 24 hours ago. API responses that
-do not decode are retried with exponential backoff (`--max-retries`,
-default 15).
-Recent changes only reach back 30 days, so a store older than that must be
-rebuilt from a dump. With `--postgres`, revisions already in the database are
-skipped; otherwise an in-memory cache deduplicates within a run.
+`sync` follows the wiki's recent changes with `mwrecent`, fetches the content
+of revisions it has not recorded yet, and appends them to
+`bundles/recentchanges/<YYYY-MM-DD>.mwrev.zst` (one new zstd frame per batch).
+Each kind of error has its own mechanism:
+
+- **Changes committed late.** Near the present (`--settle` seconds, default
+  120) recent changes are read by time from ten seconds before the position,
+  and once caught up a tail pass re-reads the last `--tail` seconds (default
+  900). Rows already seen are dropped by `rcid`, so nothing is fetched twice.
+- **Restarts.** A cycle's bundle frames, its metadata and the poller's
+  position commit together: `recentchanges/position.json` holds the poller's
+  time, continuation and seen `rcid`s, each bundle's committed length, and,
+  while a cycle runs, the Parquet file it writes. A cycle that did not commit
+  is rolled forward on the next start: the revisions already appended are
+  reported again from the bundles (not fetched again), a frame cut off part
+  way is cut back, and the cycle's unfinished Parquet file is removed. A sync
+  with no position starts at `--since`, else `--tail` seconds before the
+  newest recorded revision (what is already recorded is not fetched again),
+  else 24 hours ago. `--overlap` is gone.
+- **Gaps.** A wiki keeps recent changes for `--rc-max-age` days (30 on
+  Wikimedia wikis, MediaWiki's default 90). A position older than that, and
+  older than the oldest change the wiki still has, cannot be resumed without
+  missing revisions: `sync` refuses to start and says so. `--accept-gap`
+  resumes from the oldest change and appends the gap's bounds to
+  `recentchanges/gaps.jsonl`; rebuilding that window from a dump closes it.
+- **Deletions and hidden revisions.** Log events (deletions, restorations,
+  revision-visibility changes, suppressions, moves, merges) are recorded as
+  they come: `log` rows in the Parquet metadata, the `log_events` table in
+  Postgres. Bundles are never rewritten; a reader derives what is deleted or
+  hidden from the events (a `delete`/`revision` event lists its revisions in
+  `log_params`), and a later restoration lifts it.
+
+API responses that do not decode are retried with exponential backoff
+(`--max-retries`, default 15). With `--postgres`, revisions already in the
+database are skipped as well.
 
 Each cycle (one poll, or every poll of an `--ongoing` sync) writes its
 metadata through its own sink, finished before the next poll: with a

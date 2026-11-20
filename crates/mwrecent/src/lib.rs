@@ -150,6 +150,9 @@ pub struct Row {
     /// A move's or merge's parameters.
     #[serde(default)]
     pub logparams: Option<serde_json::Value>,
+    /// The log entry's ID, on a log row.
+    #[serde(default)]
+    pub logid: Option<u64>,
 }
 
 /// The response, as far as the follower reads it.
@@ -186,6 +189,8 @@ pub struct Change {
     pub time: u64,
     /// The log row's `(type, action, params)`, if it is one.
     pub log: Option<(String, String, Option<serde_json::Value>)>,
+    /// The log entry's ID, on a log row whose response carried one (`rcprop=loginfo`).
+    pub logid: Option<u64>,
 }
 
 /// What a batch yielded.
@@ -219,8 +224,9 @@ pub struct Poller {
 }
 
 impl Poller {
-    /// A poller starting at `time`, over `namespaces`, asking for `limit` rows per request
-    /// (500 anonymously, 5,000 with `apihighlimits`), coalescing by title.
+    /// A poller starting at `time`, over `namespaces` (every namespace when empty), asking
+    /// for `limit` rows per request (500 anonymously, 5,000 with `apihighlimits`),
+    /// coalescing by title.
     #[must_use]
     pub fn new(time: u64, namespaces: Vec<i64>, limit: u32, windows: Windows) -> Self {
         Poller {
@@ -293,7 +299,7 @@ impl Poller {
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("|");
-        [
+        let mut params: Vec<(String, String)> = [
             ("action", "query".to_string()),
             ("list", "recentchanges".into()),
             ("format", "json".into()),
@@ -306,7 +312,11 @@ impl Poller {
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
-        .collect()
+        .collect();
+        if self.namespaces.is_empty() {
+            params.retain(|(k, _)| k != "rcnamespace");
+        }
+        params
     }
 
     /// The next request: by continuation while there is one and the position is not
@@ -378,6 +388,7 @@ impl Poller {
             let is_log = row.kind == "log";
             let change = Change {
                 rcid: row.rcid,
+                logid: if is_log { row.logid } else { None },
                 title: row.title,
                 ns,
                 revid: (!is_log).then_some(row.revid),
@@ -733,6 +744,21 @@ mod tests {
         assert_eq!(p.seen().len(), 1, "rcid 1 is older than the window");
         let restored = Poller::restore(p.time, p.cont.clone(), p.seen(), vec![860], 500, w);
         assert_eq!(restored, p);
+    }
+
+    #[test]
+    fn no_namespaces_means_every_namespace_and_log_rows_carry_their_id() {
+        let t0 = parse_iso("2026-10-04T00:00:00Z").unwrap();
+        let mut p = Poller::new(t0, vec![], 500, Windows::default()).coalesce(Coalesce::Off);
+        let q = p.query(t0 + 86_400, true).to_query_string();
+        assert!(!q.contains("rcnamespace"), "{q}");
+        assert!(q.contains("rcprop=title|ids|timestamp|loginfo"), "{q}");
+        let log = row(1, "log", "Item:Q9", 0, "2026-10-04T00:00:01Z")
+            .replace(r#""logtype""#, r#""logid":77,"logtype""#);
+        let edit = row(2, "edit", "Item:Q9", 10, "2026-10-04T00:00:02Z");
+        let b = p.read(&body(&[log, edit], None), false).unwrap();
+        assert_eq!(b.changes[0].logid, Some(77));
+        assert_eq!(b.changes[1].logid, None);
     }
 
     #[test]

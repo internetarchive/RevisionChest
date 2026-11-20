@@ -10,6 +10,7 @@
 //! | `revisions` | every revision: `(revision_id, domain_id, page_id, parent_revision_id, revision_timestamp TIMESTAMP, found_in_bundle, offset_begin, length)` |
 //! | `page_metadata` | `(domain_id, page_id, page_title, page_namespace)` |
 //! | `web_resources` | the article's curid URL (`url`, `url_hash`, `numeric_page_id`, `numeric_namespace_id`, `domain_id`) |
+//! | `log_events` | each log event from recent changes, as it came: `(domain_id, rcid, log_id, log_type, log_action, page_id, page_namespace, page_title, log_timestamp, log_params JSONB)`; tombstones are derived from these by readers |
 //!
 //! Nothing is written to `documents`: pages are identified by
 //! `(domain_id, page_id)`, not by title.
@@ -362,9 +363,19 @@ fn write_batch(
         _ => std::cmp::Ordering::Greater,
     });
 
+    // Log events in rcid order, written after the pages and revisions.
+    let mut logs: Vec<&MetaEvent> = batch
+        .iter()
+        .filter(|e| matches!(e, MetaEvent::Log { .. }))
+        .collect();
+    logs.sort_by_key(|e| match e {
+        MetaEvent::Log { rcid, .. } => *rcid,
+        _ => 0,
+    });
+
     let mut attempt = 0u64;
     loop {
-        match try_write(pool, domain_id, domain, &sorted, bundle_cache) {
+        match try_write(pool, domain_id, domain, &sorted, &logs, bundle_cache) {
             Ok(()) => return Ok(()),
             Err(e) if attempt < MAX_RETRIES && is_retryable(&e) => {
                 attempt += 1;
@@ -381,6 +392,7 @@ fn try_write(
     domain_id: i32,
     domain: &str,
     sorted: &[&MetaEvent],
+    logs: &[&MetaEvent],
     bundle_cache: &Arc<RwLock<HashMap<String, i32>>>,
 ) -> Result<(), WriteError> {
     let mut client = pool
@@ -504,6 +516,47 @@ fn try_write(
              ON CONFLICT (revision_id) DO NOTHING",
             &[&domain_id],
         )?;
+    }
+
+    if !logs.is_empty() {
+        let insert = tx.prepare(
+            "INSERT INTO log_events (domain_id, rcid, log_id, log_type, log_action, page_id,
+                                     page_namespace, page_title, log_timestamp, log_params)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::text::timestamp, $10::text::jsonb)
+             ON CONFLICT (domain_id, rcid) DO NOTHING",
+        )?;
+        for ev in logs {
+            if let MetaEvent::Log {
+                rcid,
+                log_id,
+                log_type,
+                log_action,
+                page_id,
+                ns,
+                title,
+                timestamp,
+                params,
+            } = ev
+            {
+                let page_id = page_id.and_then(|p| i32::try_from(p).ok());
+                let ns = i32::try_from(*ns).ok();
+                tx.execute(
+                    &insert,
+                    &[
+                        &domain_id,
+                        &(*rcid as i64),
+                        &log_id.map(|l| l as i64),
+                        log_type,
+                        log_action,
+                        &page_id,
+                        &ns,
+                        title,
+                        timestamp,
+                        params,
+                    ],
+                )?;
+            }
+        }
     }
 
     tx.commit()?;

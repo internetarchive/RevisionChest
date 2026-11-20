@@ -2,14 +2,19 @@
 //!
 //! Reading a dump produces a stream of [`MetaEvent`]s — the site, each page's
 //! title and namespace, and for each revision the bundle it landed in with
-//! its offset and length. A [`MetaSink`] consumes that stream:
+//! its offset and length; following a wiki's recent changes adds its log
+//! events (deletions, restorations, revision-visibility changes, moves,
+//! merges), as they came, from which a reader works out what is deleted or
+//! hidden. A [`MetaSink`] consumes that stream:
 //!
 //! - [`parquet::ParquetSink`] writes one Parquet file (`type, page_id, ns,
 //!   title, rev_id, parent_rev_id, file_path, offset_begin, length,
-//!   timestamp`), the hand-off to a pipeline's own loader;
+//!   timestamp, rcid, log_id, log_type, log_action, log_params`), the
+//!   hand-off to a pipeline's own loader;
 //! - [`postgres::PostgresSink`] (feature `postgres`) writes straight into the
 //!   Wikipedia Citations Database schema: `domains`, `revision_bundles`,
-//!   `revisions`, `page_metadata` and the article `web_resources` rows.
+//!   `revisions`, `page_metadata`, the article `web_resources` rows and
+//!   `log_events`.
 //! - [`NullSink`] discards everything.
 //!
 //! Sinks run on their own thread behind a bounded channel ([`spawn`]), so a
@@ -64,6 +69,32 @@ pub enum MetaEvent {
         length: u64,
         /// Timestamp as the source gave it.
         timestamp: String,
+    },
+    /// A log event from the wiki's recent changes, recorded as it came. Bundles
+    /// are never rewritten: a deletion, suppression or hidden revision is a
+    /// tombstone a reader derives from these, and a restoration lifts it.
+    Log {
+        /// The recent change's ID, unique within the wiki.
+        rcid: u64,
+        /// The log entry's ID, when the wiki gave it.
+        log_id: Option<u64>,
+        /// `delete`, `suppress`, `move`, `merge`, `protect`, …
+        log_type: String,
+        /// `delete`, `restore`, `revision`, `move`, …
+        log_action: String,
+        /// The page the event is about, where the wiki named one (a deletion
+        /// names the deleted page).
+        page_id: Option<u64>,
+        /// The page's namespace.
+        ns: i64,
+        /// The page's title, with its namespace prefix.
+        title: String,
+        /// Timestamp as the source gave it.
+        timestamp: String,
+        /// The event's parameters as JSON (`logparams`): for a
+        /// revision-visibility change, the revision IDs and the new
+        /// visibility; for a move, the target.
+        params: Option<String>,
     },
     /// A unit of input (one dump file, one sync batch) is complete; sinks may
     /// flush.

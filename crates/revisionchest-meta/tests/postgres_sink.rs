@@ -20,7 +20,7 @@ fn config() -> Option<PostgresConfig> {
 
 fn reset(cfg: &PostgresConfig) {
     let mut c = Client::connect(&cfg.url, NoTls).unwrap();
-    c.batch_execute("DROP TABLE IF EXISTS revisions, page_metadata, web_resources, revision_bundles, domains CASCADE").unwrap();
+    c.batch_execute("DROP TABLE IF EXISTS log_events, revisions, page_metadata, web_resources, revision_bundles, domains CASCADE").unwrap();
     c.batch_execute(include_str!("schema.sql")).unwrap();
 }
 
@@ -58,6 +58,28 @@ fn events() -> Vec<MetaEvent> {
             title: "Draft:Tab\tand\\backslash".into(),
         },
         rev(4001, None, 104, 1160, 52, "2020-05-05T05:05:05Z"),
+        MetaEvent::Log {
+            rcid: 900,
+            log_id: Some(55),
+            log_type: "delete".into(),
+            log_action: "revision".into(),
+            page_id: Some(101),
+            ns: 0,
+            title: "Example Island".into(),
+            timestamp: "2020-06-01T00:00:00Z".into(),
+            params: Some(r#"{"ids":[1002],"type":"revision"}"#.into()),
+        },
+        MetaEvent::Log {
+            rcid: 901,
+            log_id: None,
+            log_type: "delete".into(),
+            log_action: "delete".into(),
+            page_id: None,
+            ns: 1,
+            title: "Talk:Example Island".into(),
+            timestamp: "2020-06-02T00:00:00Z".into(),
+            params: None,
+        },
         MetaEvent::Finalize,
     ]
 }
@@ -87,6 +109,18 @@ fn writes_every_table_and_is_idempotent() {
     assert_eq!(count(&mut c, "SELECT count(*) FROM revisions"), 4);
     assert_eq!(count(&mut c, "SELECT count(*) FROM page_metadata"), 3);
     assert_eq!(count(&mut c, "SELECT count(*) FROM web_resources"), 3);
+    assert_eq!(count(&mut c, "SELECT count(*) FROM log_events"), 2);
+    let hidden: i64 = c
+        .query_one(
+            "SELECT (log_params->'ids'->>0)::bigint FROM log_events WHERE rcid = 900 AND log_action = 'revision'",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        hidden, 1002,
+        "a reader finds the hidden revision in log_params"
+    );
 
     let row = c
         .query_one(
