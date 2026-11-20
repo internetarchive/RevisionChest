@@ -17,6 +17,11 @@ pub struct RevisionHeader {
     pub timestamp: String,
     /// Contributor's user ID; `0` for anonymous or hidden contributors.
     pub user_id: u64,
+    /// The source hid this revision's text (revision deletion or suppression),
+    /// so the empty text that follows means "unknown", not "blank". Written as
+    /// a trailing ` text_hidden=1` only when set, so a header without it reads
+    /// as `false` and bundles written before the field existed are unchanged.
+    pub text_hidden: bool,
 }
 
 /// Why a header line did not parse.
@@ -74,6 +79,7 @@ impl RevisionHeader {
                     seen_ts = true;
                 }
                 "user_id" => h.user_id = v.parse().unwrap_or(0),
+                "text_hidden" => h.text_hidden = matches!(v, "1" | "true"),
                 _ => {}
             }
         }
@@ -103,7 +109,11 @@ impl fmt::Display for RevisionHeader {
                 .unwrap_or_default(),
             self.timestamp,
             self.user_id
-        )
+        )?;
+        if self.text_hidden {
+            f.write_str(" text_hidden=1")?;
+        }
+        Ok(())
     }
 }
 
@@ -120,6 +130,7 @@ mod tests {
             parent_rev_id: Some(1001),
             timestamp: "2005-06-15T12:00:00Z".into(),
             user_id: 0,
+            text_hidden: false,
         };
         let line = h.to_line();
         assert_eq!(
@@ -142,6 +153,20 @@ mod tests {
             h.to_line(),
             "# page_id=1 ns=0 rev_id=2 parent_rev_id= timestamp=2004-01-01T00:00:00Z user_id=7"
         );
+    }
+
+    #[test]
+    fn hidden_text_is_flagged_only_when_set() {
+        let line = "# page_id=1 ns=0 rev_id=3 parent_rev_id=2 timestamp=2004-01-01T00:00:00Z user_id=7 text_hidden=1";
+        let h = RevisionHeader::parse(line).unwrap();
+        assert!(h.text_hidden);
+        assert_eq!(h.to_line(), line);
+        let plain = RevisionHeader {
+            text_hidden: false,
+            ..h
+        };
+        assert!(!plain.to_line().contains("text_hidden"));
+        assert!(!RevisionHeader::parse(&plain.to_line()).unwrap().text_hidden);
     }
 
     #[test]

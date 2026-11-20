@@ -6,7 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "The .mwrev.zst revision bundle format: a zstd stream of '# page_id=… rev_id=…' header lines followed by space-prefixed text lines; writer with byte offsets, streaming reader"
-publish = false
+keywords = ["mediawiki", "wikipedia", "wikidata", "zstd"]
+categories = ["encoding", "parser-implementations"]
 
 [dependencies]
 zstd.workspace = true
