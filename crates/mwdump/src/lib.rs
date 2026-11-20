@@ -16,7 +16,7 @@
 //!     match event? {
 //!         Event::PageStart(page) => println!("page {} {}", page.id, page.title),
 //!         Event::Revision(rev) => println!("  rev {} ({} bytes)", rev.id, rev.text.len()),
-//!         Event::PageEnd { .. } | Event::SiteInfo(_) => {}
+//!         _ => {} // the site information, page ends, and any later kind of event
 //!     }
 //! }
 //! # Ok::<(), mwdump::DumpError>(())

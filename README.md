@@ -23,9 +23,10 @@ dumps and bundles the same way.
 The crates depend only downwards: `revisionchest` → `mwdump`, `mwrev`,
 `revisionchest-meta`; the libraries are independent of each other.
 
-`mwdump` and `mwrev` are the crates published to crates.io (`mwdump` not
-yet: it is still `publish = false`). They carry their own
-versions, starting at 0.1.0, which follow semver for each crate's own API.
+`mwdump`, `mwrecent` and `mwrev` are published to crates.io. They carry
+their own versions, starting at 0.1.0, which follow semver for each crate's
+own API; their public structs and `mwdump`'s `Event` are non-exhaustive, so a
+field or a kind of event can be added in a minor release.
 The binary and `revisionchest-meta` are not published and share the
 workspace version; "Changes from 0.1" below is about them.
 

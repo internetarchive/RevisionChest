@@ -59,6 +59,7 @@ fn check(events: &[Event]) {
                 current = None;
             }
             Event::SiteInfo(_) => panic!("second siteinfo"),
+            other => panic!("unexpected event {other:?}"),
         }
     }
     assert!(current.is_none());
@@ -136,11 +137,8 @@ fn filtered_by_hand(events: &[Event], keep: &[i64]) -> Vec<Event> {
                     out.push(e.clone());
                 }
             }
-            Event::Revision(_) | Event::PageEnd { .. } => {
-                if in_kept_page {
-                    out.push(e.clone());
-                }
-            }
+            Event::Revision(_) | Event::PageEnd { .. } if in_kept_page => out.push(e.clone()),
+            _ => {}
         }
     }
     out

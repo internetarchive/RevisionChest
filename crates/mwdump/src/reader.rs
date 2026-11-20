@@ -1,6 +1,5 @@
 //! The event reader.
 
-use std::borrow::Cow;
 use std::io::BufRead;
 
 use quick_xml::Reader;
@@ -11,6 +10,7 @@ use crate::DumpError;
 
 /// One namespace from `<siteinfo><namespaces>`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct Namespace {
     /// The namespace number (`key` attribute).
     pub key: i64,
@@ -22,6 +22,7 @@ pub struct Namespace {
 
 /// The dump's `<siteinfo>`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct SiteInfo {
     /// `<sitename>`.
     pub sitename: Option<String>,
@@ -55,6 +56,7 @@ impl SiteInfo {
 
 /// What a page carries besides its revisions.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct PageHeader {
     /// The page ID (`<id>` directly under `<page>`).
     pub id: u64,
@@ -69,6 +71,7 @@ pub struct PageHeader {
 /// A further content slot of a revision (export schema 0.11's `<content>`): every slot
 /// but the main one, which [`Revision`] carries itself.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct Slot {
     /// The slot role (`mediainfo`, …).
     pub role: String,
@@ -90,6 +93,7 @@ pub struct Slot {
 
 /// One revision of a page.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 // One per flag the export writes: `<minor />` and three `deleted`.
 #[allow(clippy::struct_excessive_bools)]
 pub struct Revision {
@@ -138,8 +142,9 @@ pub struct Revision {
     pub slots: Vec<Slot>,
 }
 
-/// What the reader yields.
+/// What the reader yields. More kinds of event may be added in a minor release.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Event {
     /// The `<siteinfo>` block; comes first when the dump has one.
     SiteInfo(SiteInfo),
@@ -234,7 +239,7 @@ impl<R: BufRead> DumpReader<R> {
         self.skip_page = false;
         self.buf.clear();
         self.reader
-            .read_to_end_into(QName(b"page"), &mut self.buf)
+            .read_to_end_into(QName("page"), &mut self.buf)
             .map_err(|e| self.xml_err(e))?;
         if self.path.last().map(String::as_str) == Some("page") {
             self.path.pop();
@@ -259,16 +264,20 @@ impl<R: BufRead> DumpReader<R> {
             .map(|i| self.path[i].as_str())
     }
 
-    fn attr(e: &BytesStart<'_>, name: &[u8]) -> Option<String> {
+    fn attr(e: &BytesStart<'_>, name: &str) -> Option<String> {
         e.attributes()
             .flatten()
             .find(|a| a.key.local_name().as_ref() == name)
-            .and_then(|a| a.unescape_value().ok().map(|v| v.into_owned()))
+            .and_then(|a| {
+                a.normalized_value(quick_xml::XmlVersion::default())
+                    .ok()
+                    .map(|v| v.into_owned())
+            })
     }
 
     /// Handles the start of an element (also called for empty elements).
     fn on_start(&mut self, e: &BytesStart<'_>, empty: bool) -> Result<Option<Event>, DumpError> {
-        let name = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
+        let name = e.local_name().as_ref().to_owned();
         self.text.clear();
         let mut out = None;
         match name.as_str() {
@@ -276,8 +285,12 @@ impl<R: BufRead> DumpReader<R> {
                 self.root_lang = e
                     .attributes()
                     .flatten()
-                    .find(|a| a.key.as_ref() == b"xml:lang")
-                    .and_then(|a| a.unescape_value().ok().map(|v| v.into_owned()));
+                    .find(|a| a.key.as_ref() == "xml:lang")
+                    .and_then(|a| {
+                        a.normalized_value(quick_xml::XmlVersion::default())
+                            .ok()
+                            .map(|v| v.into_owned())
+                    });
             }
             "siteinfo" => {
                 self.siteinfo = Some(SiteInfo {
@@ -288,13 +301,13 @@ impl<R: BufRead> DumpReader<R> {
             // `name` is not on the path yet, so the innermost open element is the parent.
             "namespace" if self.path.last().map(String::as_str) == Some("namespaces") => {
                 if let Some(si) = self.siteinfo.as_mut() {
-                    let key = Self::attr(e, b"key")
+                    let key = Self::attr(e, "key")
                         .and_then(|k| k.parse().ok())
                         .unwrap_or(0);
                     si.namespaces.push(Namespace {
                         key,
                         name: String::new(),
-                        case: Self::attr(e, b"case"),
+                        case: Self::attr(e, "case"),
                     });
                 }
             }
@@ -304,7 +317,7 @@ impl<R: BufRead> DumpReader<R> {
             }
             "redirect" => {
                 if let Some(p) = self.page.as_mut() {
-                    p.redirect = Self::attr(e, b"title");
+                    p.redirect = Self::attr(e, "title");
                 }
             }
             "revision" => {
@@ -319,7 +332,7 @@ impl<R: BufRead> DumpReader<R> {
             }
             "contributor" => {
                 if let Some(r) = self.revision.as_mut() {
-                    if Self::attr(e, b"deleted").is_some() {
+                    if Self::attr(e, "deleted").is_some() {
                         r.user_hidden = true;
                     }
                 }
@@ -336,8 +349,8 @@ impl<R: BufRead> DumpReader<R> {
                 }
             }
             "text" => {
-                let bytes = Self::attr(e, b"bytes").and_then(|b| b.parse().ok());
-                let hidden = Self::attr(e, b"deleted").is_some();
+                let bytes = Self::attr(e, "bytes").and_then(|b| b.parse().ok());
+                let hidden = Self::attr(e, "deleted").is_some();
                 match self.path.last().map(String::as_str) {
                     Some("revision") => self.rv(|r| {
                         r.text_bytes = bytes;
@@ -352,7 +365,7 @@ impl<R: BufRead> DumpReader<R> {
             }
             "comment" if self.path.last().map(String::as_str) == Some("revision") => {
                 if let Some(r) = self.revision.as_mut() {
-                    if Self::attr(e, b"deleted").is_some() {
+                    if Self::attr(e, "deleted").is_some() {
                         r.comment = None;
                         r.comment_hidden = true;
                     } else if empty {
@@ -527,7 +540,7 @@ impl<R: BufRead> DumpReader<R> {
                 }
             }
             XmlEvent::Empty(e) => {
-                let name = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
+                let name = e.local_name().as_ref().to_owned();
                 let out = self.on_start(&e, true)?;
                 // An empty element also "ends": `<text … />`, `<namespace key="0" />`.
                 self.path.push(name.clone());
@@ -549,20 +562,39 @@ impl<R: BufRead> DumpReader<R> {
                     return Ok(Step::Emit(out));
                 }
             }
+            // Text comes decoded; each entity reference between its runs is an
+            // event of its own (`&amp;`, `&#10;`), resolved here.
             XmlEvent::Text(e) => {
                 if self.wants_text() {
-                    match e.unescape() {
-                        // Entities were decoded into a new String: move it
-                        // in when it is the element's only text (the usual case).
-                        Ok(Cow::Owned(t)) if self.text.is_empty() => self.text = t,
-                        Ok(t) => self.text.push_str(&t),
-                        Err(err) => return Err(self.xml_err(err)),
+                    self.text.push_str(&e);
+                }
+            }
+            XmlEvent::GeneralRef(r) => {
+                if self.wants_text() {
+                    match r.resolve_char_ref().map_err(|e| self.xml_err(e))? {
+                        Some(c) => self.text.push(c),
+                        None => {
+                            let name: &str = &r;
+                            self.text.push_str(match name {
+                                "amp" => "&",
+                                "lt" => "<",
+                                "gt" => ">",
+                                "quot" => "\"",
+                                "apos" => "'",
+                                other => {
+                                    return Err(DumpError::Malformed(format!(
+                                        "unknown entity reference `&{other};` at byte {}",
+                                        self.reader.buffer_position()
+                                    )));
+                                }
+                            });
+                        }
                     }
                 }
             }
             XmlEvent::CData(e) => {
                 if self.wants_text() {
-                    self.text.push_str(&String::from_utf8_lossy(&e));
+                    self.text.push_str(&e);
                 }
             }
             XmlEvent::Eof => {

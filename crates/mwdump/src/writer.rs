@@ -23,10 +23,21 @@ use crate::{DumpError, SCHEMA_NAMESPACE, SCHEMA_VERSION, sha1_base36};
 /// ```
 /// use mwdump::{PageHeader, Revision, SiteInfo, Writer};
 ///
+/// // The types are non-exhaustive: start from their defaults and set what you have.
+/// let mut site = SiteInfo::default();
+/// site.sitename = Some("Example".into());
+/// let mut page = PageHeader::default();
+/// page.id = 1;
+/// page.title = "Main Page".into();
+/// let mut rev = Revision::default();
+/// rev.id = 10;
+/// rev.timestamp = "2026-01-01T00:00:00Z".into();
+/// rev.text = "Hello".into();
+///
 /// let mut w = Writer::new(Vec::new());
-/// w.start(&SiteInfo { sitename: Some("Example".into()), ..SiteInfo::default() })?;
-/// w.open_page(&PageHeader { id: 1, ns: 0, title: "Main Page".into(), redirect: None })?;
-/// w.revision(&Revision { id: 10, timestamp: "2026-01-01T00:00:00Z".into(), text: "Hello".into(), ..Revision::default() })?;
+/// w.start(&site)?;
+/// w.open_page(&page)?;
+/// w.revision(&rev)?;
 /// w.close_page()?;
 /// let xml = String::from_utf8(w.finish()?).unwrap();
 /// assert!(xml.contains("<text bytes=\"5\""));

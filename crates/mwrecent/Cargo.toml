@@ -8,7 +8,6 @@ repository.workspace = true
 description = "Following a MediaWiki wiki by list=recentchanges: the next query, and each batch read with a settle window, a tail pass, deduplication by rcid and log rows; coalescing by title optional"
 keywords = ["mediawiki", "wikipedia", "wikidata", "recentchanges"]
 categories = ["api-bindings", "parser-implementations"]
-publish = false
 
 [dependencies]
 serde.workspace = true
