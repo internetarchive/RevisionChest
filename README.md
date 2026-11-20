@@ -15,12 +15,13 @@ dumps and bundles the same way.
 | Crate | What it is |
 |---|---|
 | [`mwdump`](crates/mwdump) | Streaming reader for MediaWiki XML dumps (`.xml`, `.bz2`, `.gz`, `.7z` — all streamed, 7z included). One event per site-info block, page start, revision and page end; a revision carries page id, namespace, ids, timestamp, contributor, flags, comment, model, text and the dump's SHA-1. Nothing larger than one revision is held in memory. |
+| [`mwrecent`](crates/mwrecent) | Following a wiki by `list=recentchanges`, without sending anything itself: the next query, and each batch read with a settle window near the present, a tail pass for late rows, deduplication by `rcid`, and log rows (deletions, moves, merges, suppression). Rows about one title are coalesced to the highest revision by default; `Coalesce::Off` keeps every one. Ported from Triplespace's follower. |
 | [`mwrev`](crates/mwrev) | The `.mwrev.zst` bundle format: header line + space-prefixed text lines per revision. `BundleWriter` (create or append, with decompressed byte offsets), `BundleReader` (streams every frame back), `RevisionHeader` parse/format, `read_at` for tooling. |
 | [`revisionchest-meta`](crates/revisionchest-meta) | Where the metadata goes: `MetaEvent` (site, page, revision location), the `MetaSink` trait, a `ParquetSink` (feature `parquet`, default) and a `PostgresSink` (feature `postgres`) that writes the WCD schema — `domains`, `revision_bundles`, `revisions`, `page_metadata`, article `web_resources`. |
 | [`revisionchest`](crates/revisionchest) | The `RevisionChest` binary: `build` (dumps → bundles, in parallel over a directory) and `sync` (recent changes → daily bundles). |
 
 The crates depend only downwards: `revisionchest` → `mwdump`, `mwrev`,
-`revisionchest-meta`; the three libraries are independent of each other.
+`revisionchest-meta`; the libraries are independent of each other.
 
 `mwdump` and `mwrev` are the crates published to crates.io (`mwdump` not
 yet: it is still `publish = false`). They carry their own
