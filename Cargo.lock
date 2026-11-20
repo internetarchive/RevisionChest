@@ -1510,7 +1510,7 @@ dependencies = [
 
 [[package]]
 name = "mwdump"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bzip2",
  "flate2",
@@ -1523,7 +1523,7 @@ dependencies = [
 
 [[package]]
 name = "mwrecent"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1532,7 +1532,7 @@ dependencies = [
 
 [[package]]
 name = "mwrev"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "tempfile",
  "thiserror",

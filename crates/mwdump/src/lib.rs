@@ -28,6 +28,9 @@
 //! [`DumpReader::with_namespaces`] drops pages outside a namespace list
 //! without decoding their revisions.
 //!
+//! [`DumpReader::pages`] collects the events into whole pages, each with all
+//! its revisions, for callers that work a page at a time.
+//!
 //! A revision carries what the export hid (text, comment, contributor) and,
 //! for a dump in schema 0.11, its further content slots. [`Writer`] writes
 //! the same shape back out, page by page and revision by revision, as
@@ -36,10 +39,12 @@
 #![forbid(unsafe_code)]
 
 mod open;
+mod pages;
 mod reader;
 mod writer;
 
 pub use open::{open, open_path};
+pub use pages::{Page, Pages};
 pub use reader::{DumpReader, Event, Namespace, PageHeader, Revision, SiteInfo, Slot};
 pub use writer::Writer;
 
