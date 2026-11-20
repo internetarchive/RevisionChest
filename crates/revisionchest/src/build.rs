@@ -105,6 +105,7 @@ pub fn build_file(
                     parent_rev_id: r.parent_id,
                     timestamp: r.timestamp.clone(),
                     user_id: r.user_id.unwrap_or(0),
+                    text_hidden: r.text_hidden,
                 };
                 let loc = writer.write_revision(&header, &r.text)?;
                 n_revisions += 1;

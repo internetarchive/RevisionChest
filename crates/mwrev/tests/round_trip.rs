@@ -10,6 +10,7 @@ fn h(page: u64, rev: u64, parent: Option<u64>) -> RevisionHeader {
         parent_rev_id: parent,
         timestamp: "2004-01-01T00:00:00Z".into(),
         user_id: 7,
+        text_hidden: false,
     }
 }
 

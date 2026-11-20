@@ -13,7 +13,10 @@
 //! ```
 //!
 //! `parent_rev_id` is empty for a page's first revision; `user_id` is `0`
-//! when the contributor is anonymous or hidden. The text is written line by
+//! when the contributor is anonymous or hidden. A revision whose text the
+//! source hid (revision deletion, suppression) has no text lines and a
+//! trailing ` text_hidden=1` on its header, so a reader can tell "hidden"
+//! from "blank"; the key is absent otherwise. The text is written line by
 //! line (`str::lines`), so a trailing newline is not preserved and `\r\n`
 //! becomes `\n`.
 //!

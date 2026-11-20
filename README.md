@@ -111,7 +111,11 @@ environment or `.env`.
 ```
 
 `parent_rev_id` is empty for a first revision; `user_id` is `0` for
-anonymous or hidden contributors. Text is written line by line, so a
+anonymous or hidden contributors. A revision whose text the wiki has hidden
+(revision deletion or suppression) is written with no text lines and a
+trailing ` text_hidden=1` on its header, so a reader can tell "hidden" from
+"blank"; other headers do not carry the key, and readers ignore keys they do
+not know. Text is written line by line, so a
 trailing newline is not kept and `\r\n` becomes `\n`.
 
 **Offsets** are decompressed byte offsets from the start of the bundle's
@@ -139,6 +143,9 @@ window) read the same way. Budget up to 128 MiB per open encoder or decoder.
   (about half the size on enwiki history). Readers need no change: 128 MiB
   is zstd's default decoder limit, and 0.1 readers read new bundles.
 
+- A revision whose text the wiki has hidden carries ` text_hidden=1` on its
+  bundle header (`RevisionHeader::text_hidden`); it used to be
+  indistinguishable from a blank revision. Bundles are otherwise unchanged.
 - Split into four crates; the binary's command line is unchanged except
   that `--db` (the SQLite index) is gone and `--postgres` is explicit.
 - `.7z` dumps are streamed; previously the whole decompressed dump was read

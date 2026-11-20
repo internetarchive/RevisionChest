@@ -332,10 +332,11 @@ fn parse_revisions(resp: &Value, namespaces: Option<&[i64]>) -> BTreeMap<String,
             if rev_id == 0 || timestamp.len() < 10 {
                 continue;
             }
-            let text = rev["slots"]["main"]["content"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
+            let main = &rev["slots"]["main"];
+            // A hidden revision comes back with `texthidden` and no content.
+            let text_hidden = main["texthidden"].as_bool().unwrap_or(false)
+                || rev["texthidden"].as_bool().unwrap_or(false);
+            let text = main["content"].as_str().unwrap_or("").to_string();
             by_day
                 .entry(timestamp[..10].to_string())
                 .or_default()
@@ -347,6 +348,7 @@ fn parse_revisions(resp: &Value, namespaces: Option<&[i64]>) -> BTreeMap<String,
                         parent_rev_id: rev["parentid"].as_u64().filter(|p| *p != 0),
                         timestamp: timestamp.to_string(),
                         user_id: rev["userid"].as_u64().unwrap_or(0),
+                        text_hidden,
                     },
                     text,
                 });
@@ -504,5 +506,27 @@ mod tests {
         assert_eq!(parse_revisions(&resp, Some(&[0, 118])).len(), 1);
         let resp = api_response(&[(7, 0, None, "", "x")]);
         assert!(parse_revisions(&resp, None).is_empty());
+    }
+
+    #[test]
+    fn hidden_text_is_flagged_not_read_as_blank() {
+        let resp = serde_json::json!({"query": {"pages": [{
+            "pageid": 7, "ns": 0, "title": "P7",
+            "revisions": [
+                {"revid": 100, "parentid": 0, "timestamp": "2026-10-19T00:00:00Z", "userid": 42,
+                 "slots": {"main": {"content": "", "contentmodel": "wikitext"}}},
+                {"revid": 101, "parentid": 100, "timestamp": "2026-10-19T00:01:00Z", "userid": 42,
+                 "slots": {"main": {"texthidden": true}}}
+            ]
+        }]}});
+        let by_day = parse_revisions(&resp, None);
+        let revs = &by_day["2026-10-19"];
+        assert!(
+            !revs[0].header.text_hidden,
+            "a blank revision is not hidden"
+        );
+        assert!(revs[1].header.text_hidden);
+        assert_eq!(revs[1].text, "");
+        assert!(revs[1].header.to_line().ends_with(" text_hidden=1"));
     }
 }
