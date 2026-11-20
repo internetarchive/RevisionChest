@@ -16,6 +16,8 @@ pub struct Namespace {
     pub key: i64,
     /// The canonical name; empty for the main namespace.
     pub name: String,
+    /// The `case` attribute: `first-letter` or `case-sensitive`.
+    pub case: Option<String>,
 }
 
 /// The dump's `<siteinfo>`.
@@ -29,6 +31,8 @@ pub struct SiteInfo {
     pub base: Option<String>,
     /// `<generator>`.
     pub generator: Option<String>,
+    /// `<case>`: `first-letter` or `case-sensitive`.
+    pub case: Option<String>,
     /// The `xml:lang` of the root element, when present.
     pub lang: Option<String>,
     /// The namespaces table.
@@ -62,8 +66,32 @@ pub struct PageHeader {
     pub redirect: Option<String>,
 }
 
+/// A further content slot of a revision (export schema 0.11's `<content>`): every slot
+/// but the main one, which [`Revision`] carries itself.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Slot {
+    /// The slot role (`mediainfo`, …).
+    pub role: String,
+    /// The revision whose content this is (`<origin>`).
+    pub origin: Option<u64>,
+    /// The content model.
+    pub model: Option<String>,
+    /// The content format.
+    pub format: Option<String>,
+    /// The content, verbatim. Empty when hidden; see [`Slot::text_hidden`].
+    pub text: String,
+    /// The dump hid the content (`<text deleted="deleted" />`).
+    pub text_hidden: bool,
+    /// The `bytes` attribute of `<text>`, when present.
+    pub text_bytes: Option<u64>,
+    /// The dump's `<sha1>` of the content; `None` when absent or empty.
+    pub sha1: Option<String>,
+}
+
 /// One revision of a page.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+// One per flag the export writes: `<minor />` and three `deleted`.
+#[allow(clippy::struct_excessive_bools)]
 pub struct Revision {
     /// The page this revision belongs to (repeated here so a consumer that
     /// only looks at revisions needs no state).
@@ -88,6 +116,10 @@ pub struct Revision {
     pub minor: bool,
     /// The edit summary; `None` when absent or hidden.
     pub comment: Option<String>,
+    /// The dump hid the edit summary (`<comment deleted="deleted" />`).
+    pub comment_hidden: bool,
+    /// The revision whose main-slot content this is (`<origin>`), where the dump says.
+    pub origin: Option<u64>,
     /// The content model (`wikitext`, `wikibase-item`, …).
     pub model: Option<String>,
     /// The content format (`text/x-wiki`, …).
@@ -99,8 +131,11 @@ pub struct Revision {
     pub text_hidden: bool,
     /// The `bytes` attribute of `<text>`, when present.
     pub text_bytes: Option<u64>,
-    /// The dump's `<sha1>` of the text (MediaWiki's base-36 SHA-1).
+    /// The dump's `<sha1>` of the text (MediaWiki's base-36 SHA-1); `None` when absent
+    /// or empty, as it is where the text is hidden.
     pub sha1: Option<String>,
+    /// The further content slots, in dump order; empty for a single-slot revision.
+    pub slots: Vec<Slot>,
 }
 
 /// What the reader yields.
@@ -259,6 +294,7 @@ impl<R: BufRead> DumpReader<R> {
                     si.namespaces.push(Namespace {
                         key,
                         name: String::new(),
+                        case: Self::attr(e, b"case"),
                     });
                 }
             }
@@ -293,18 +329,32 @@ impl<R: BufRead> DumpReader<R> {
                     r.minor = true;
                 }
             }
-            "text" => {
+            // `name` is not on the path yet, so the innermost open element is the parent.
+            "content" if self.path.last().map(String::as_str) == Some("revision") => {
                 if let Some(r) = self.revision.as_mut() {
-                    r.text_bytes = Self::attr(e, b"bytes").and_then(|b| b.parse().ok());
-                    if Self::attr(e, b"deleted").is_some() {
-                        r.text_hidden = true;
-                    }
+                    r.slots.push(Slot::default());
                 }
             }
-            "comment" => {
+            "text" => {
+                let bytes = Self::attr(e, b"bytes").and_then(|b| b.parse().ok());
+                let hidden = Self::attr(e, b"deleted").is_some();
+                match self.path.last().map(String::as_str) {
+                    Some("revision") => self.rv(|r| {
+                        r.text_bytes = bytes;
+                        r.text_hidden |= hidden;
+                    }),
+                    Some("content") => self.sl(|s| {
+                        s.text_bytes = bytes;
+                        s.text_hidden |= hidden;
+                    }),
+                    _ => {}
+                }
+            }
+            "comment" if self.path.last().map(String::as_str) == Some("revision") => {
                 if let Some(r) = self.revision.as_mut() {
                     if Self::attr(e, b"deleted").is_some() {
                         r.comment = None;
+                        r.comment_hidden = true;
                     } else if empty {
                         r.comment = Some(String::new());
                     }
@@ -339,6 +389,7 @@ impl<R: BufRead> DumpReader<R> {
             ("dbname", Some("siteinfo")) => self.si(|s| s.dbname = Some(text)),
             ("base", Some("siteinfo")) => self.si(|s| s.base = Some(text)),
             ("generator", Some("siteinfo")) => self.si(|s| s.generator = Some(text)),
+            ("case", Some("siteinfo")) => self.si(|s| s.case = Some(text)),
             ("namespace", Some("namespaces")) => self.si(|s| {
                 if let Some(ns) = s.namespaces.last_mut() {
                     ns.name = text;
@@ -364,11 +415,23 @@ impl<R: BufRead> DumpReader<R> {
             ("id", Some("revision")) => self.rv(|r| r.id = text.trim().parse().unwrap_or(0)),
             ("parentid", Some("revision")) => self.rv(|r| r.parent_id = text.trim().parse().ok()),
             ("timestamp", Some("revision")) => self.rv(|r| r.timestamp = text.trim().to_string()),
-            ("comment", Some("revision")) => self.rv(|r| r.comment = Some(text)),
+            ("comment", Some("revision")) => self.rv(|r| {
+                if !r.comment_hidden {
+                    r.comment = Some(text);
+                }
+            }),
+            ("origin", Some("revision")) => self.rv(|r| r.origin = text.trim().parse().ok()),
             ("model", Some("revision")) => self.rv(|r| r.model = Some(text.trim().to_string())),
             ("format", Some("revision")) => self.rv(|r| r.format = Some(text.trim().to_string())),
-            ("sha1", Some("revision")) => self.rv(|r| r.sha1 = Some(text.trim().to_string())),
+            ("sha1", Some("revision")) => self.rv(|r| r.sha1 = non_empty(&text)),
             ("text", Some("revision")) => self.rv(|r| r.text = text),
+            // a further slot
+            ("role", Some("content")) => self.sl(|s| s.role = text.trim().to_string()),
+            ("origin", Some("content")) => self.sl(|s| s.origin = text.trim().parse().ok()),
+            ("model", Some("content")) => self.sl(|s| s.model = Some(text.trim().to_string())),
+            ("format", Some("content")) => self.sl(|s| s.format = Some(text.trim().to_string())),
+            ("text", Some("content")) => self.sl(|s| s.text = text),
+            ("sha1", Some("content")) => self.sl(|s| s.sha1 = non_empty(&text)),
             ("username", Some("contributor")) if in_revision => {
                 self.rv(|r| r.user_name = Some(text))
             }
@@ -417,6 +480,16 @@ impl<R: BufRead> DumpReader<R> {
             f(r);
         }
     }
+    fn sl(&mut self, f: impl FnOnce(&mut Slot)) {
+        if let Some(s) = self.revision.as_mut().and_then(|r| r.slots.last_mut()) {
+            f(s);
+        }
+    }
+}
+
+fn non_empty(text: &str) -> Option<String> {
+    let t = text.trim();
+    (!t.is_empty()).then(|| t.to_string())
 }
 
 impl<R: BufRead> DumpReader<R> {
@@ -519,11 +592,14 @@ impl<R: BufRead> DumpReader<R> {
                     | "dbname"
                     | "base"
                     | "generator"
+                    | "case"
                     | "namespace"
                     | "title"
                     | "ns"
                     | "id"
                     | "parentid"
+                    | "origin"
+                    | "role"
                     | "timestamp"
                     | "comment"
                     | "model"

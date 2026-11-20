@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Streaming reader for MediaWiki XML dumps (pages-meta-history and friends): one event per page start, revision and page end, from .xml, .bz2, .gz or .7z"
+description = "Streaming reader and writer for MediaWiki XML dumps (pages-meta-history and friends): one event per page start, revision and page end, from .xml, .bz2, .gz or .7z, with hidden parts and content slots"
 publish = false
 
 [dependencies]
@@ -13,6 +13,7 @@ quick-xml.workspace = true
 bzip2.workspace = true
 flate2.workspace = true
 sevenz-rust2.workspace = true
+sha1.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
