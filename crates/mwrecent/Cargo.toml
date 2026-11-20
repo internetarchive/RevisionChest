@@ -1,0 +1,16 @@
+[package]
+name = "mwrecent"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Following a MediaWiki wiki by list=recentchanges: the next query, and each batch read with a settle window, a tail pass, deduplication by rcid and log rows; coalescing by title optional"
+keywords = ["mediawiki", "wikipedia", "wikidata", "recentchanges"]
+categories = ["api-bindings", "parser-implementations"]
+publish = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
