@@ -1,65 +1,139 @@
-//! `sync`: poll `list=recentchanges`, fetch the new revisions' content and
-//! append them to daily bundles under `<output>/recentchanges/`.
+//! `sync`: follow a wiki's recent changes with `mwrecent`, fetch the new
+//! revisions' content and append them to daily bundles under
+//! `<output>/recentchanges/`, recording log events as they come.
+//!
+//! **Correctness.** Each source of error has its own mechanism, in place of a
+//! fixed overlap:
+//!
+//! - *Late rows*: `mwrecent` reads by time near the present (the settle
+//!   window) and re-reads the recent past once caught up (the tail pass),
+//!   dropping rows it has seen by `rcid`.
+//! - *Restarts*: a cycle's bundle frames, its metadata and the poller's
+//!   position commit together. The position (`recentchanges/position.json`)
+//!   holds the poller's time, continuation and seen `rcid`s, each bundle's
+//!   committed length, and, while a cycle runs, the Parquet file it is
+//!   writing. On start, a cycle that did not commit is rolled forward: the
+//!   revisions in the bundles past their committed length are reported again
+//!   from the bundles, a frame cut off part way is cut back, the unfinished
+//!   Parquet file is removed, and the poller resumes from the committed
+//!   position. Nothing is fetched or appended twice.
+//! - *Gaps*: a position older than the wiki keeps recent changes
+//!   (`--rc-max-age`), and older than its oldest retained change, cannot be
+//!   resumed without missing revisions. `sync` refuses to start;
+//!   `--accept-gap` resumes from the oldest change and records the gap in
+//!   `recentchanges/gaps.jsonl`.
+//! - *Later changes*: deletions, suppressions, revision-visibility changes,
+//!   restorations, moves and merges are recorded as log events; bundles are
+//!   never rewritten, and readers derive tombstones from the events.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Duration, Utc};
 use moka::sync::Cache;
+use mwrecent::{Change, Coalesce, Poller, Windows};
 use mwrev::{BundleWriter, RevisionHeader};
 use reqwest::blocking::Client;
 use revisionchest_meta::{MetaEvent, MetaSender};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::args::SyncArgs;
 use crate::log;
 
-/// Decides which revision IDs are already recorded (Postgres when configured).
+/// Decides which revision IDs are already recorded (Postgres or Parquet).
 pub type AlreadyRecorded = Box<dyn Fn(&[u64]) -> HashSet<u64> + Send>;
 
-fn parse_ts(ts: &str) -> Option<DateTime<Utc>> {
-    let n = revisionchest_meta::timestamp::normalize_utc(ts)?;
-    DateTime::parse_from_rfc3339(&n)
-        .ok()
-        .map(|d| d.with_timezone(&Utc))
-}
+/// Rows per `list=recentchanges` request (the anonymous limit).
+const LIMIT: u32 = 500;
+/// Revisions per `prop=revisions` request.
+const FETCH_CHUNK: usize = 50;
+/// The position file's name, in `<output>/recentchanges/`.
+pub const POSITION_FILE: &str = "position.json";
+/// Where accepted gaps are recorded, one JSON object per line.
+pub const GAPS_FILE: &str = "gaps.jsonl";
 
 fn other<E: std::fmt::Display>(e: E) -> io::Error {
     io::Error::other(e.to_string())
 }
 
-/// GETs `url` with `params` and decodes JSON, retrying a response that does
-/// not decode (a truncated or HTML error body) with exponential backoff.
-fn request_with_retry(
-    client: &Client,
-    url: &str,
-    params: &[(&str, &str)],
+/// A wiki's Action API: one GET, its body returned as text.
+pub trait Wiki {
+    /// Sends `params` and returns the response body.
+    ///
+    /// # Errors
+    ///
+    /// When the request fails.
+    fn get(&self, params: &[(String, String)]) -> io::Result<String>;
+}
+
+/// The Action API over HTTP, retrying a response that is not JSON (a truncated
+/// or HTML error body) with exponential backoff.
+pub struct HttpWiki {
+    client: Client,
+    api: String,
     max_retries: u32,
-) -> io::Result<Value> {
-    for attempt in 0..=max_retries {
-        let response = client.get(url).query(params).send().map_err(other)?;
-        match response.json::<Value>() {
-            Ok(v) => return Ok(v),
-            Err(e) if attempt < max_retries => {
-                let delay = std::time::Duration::from_secs(2u64.pow(attempt.min(20)));
-                log(&format!(
-                    "Failed to decode response (attempt {}/{}): {e}. Retrying in {delay:?}",
-                    attempt + 1,
-                    max_retries + 1
-                ));
-                std::thread::sleep(delay);
-            }
-            Err(e) => {
-                return Err(other(format!(
-                    "failed to decode response after {} attempts: {e}",
-                    max_retries + 1
-                )));
+}
+
+impl HttpWiki {
+    /// The API of `https://{domain}/w/api.php`, with the User-Agent the
+    /// Wikimedia policy asks for.
+    ///
+    /// # Errors
+    ///
+    /// When the HTTP client cannot be built.
+    pub fn new(domain: &str, max_retries: u32) -> io::Result<Self> {
+        let user_agent = format!(
+            "{}/{} ({})",
+            std::env::var("UA_APP_NAME").unwrap_or_else(|_| "RevisionChest".into()),
+            std::env::var("UA_APP_VERSION").unwrap_or_else(|_| env!("CARGO_PKG_VERSION").into()),
+            std::env::var("UA_CONTACT_INFO")
+                .or_else(|_| std::env::var("CONTACT_EMAIL"))
+                .unwrap_or_else(|_| "https://github.com/internetarchive/RevisionChest".into())
+        );
+        let client = Client::builder()
+            .user_agent(user_agent)
+            .build()
+            .map_err(other)?;
+        Ok(Self {
+            client,
+            api: format!("https://{domain}/w/api.php"),
+            max_retries,
+        })
+    }
+}
+
+impl Wiki for HttpWiki {
+    fn get(&self, params: &[(String, String)]) -> io::Result<String> {
+        for attempt in 0..=self.max_retries {
+            let body = self
+                .client
+                .get(&self.api)
+                .query(params)
+                .send()
+                .and_then(reqwest::blocking::Response::text)
+                .map_err(other)?;
+            match serde_json::from_str::<Value>(&body) {
+                Ok(_) => return Ok(body),
+                Err(e) if attempt < self.max_retries => {
+                    let delay = std::time::Duration::from_secs(2u64.pow(attempt.min(20)));
+                    log(&format!(
+                        "Failed to decode response (attempt {}/{}): {e}. Retrying in {delay:?}",
+                        attempt + 1,
+                        self.max_retries + 1
+                    ));
+                    std::thread::sleep(delay);
+                }
+                Err(e) => {
+                    return Err(other(format!(
+                        "failed to decode response after {} attempts: {e}",
+                        self.max_retries + 1
+                    )));
+                }
             }
         }
+        unreachable!("loop returns on the last attempt")
     }
-    unreachable!("loop returns on the last attempt")
 }
 
 /// Minutes between polls when `--ongoing`: `--interval`, else `SYNC_INTERVAL`, else 10.
@@ -73,241 +147,510 @@ pub fn interval_mins(args: &SyncArgs) -> u64 {
         .unwrap_or(10)
 }
 
-/// The state a sync carries from one cycle to the next: where to poll from,
-/// the HTTP client, and which revisions this process already fetched.
+/// The settle and tail windows, from `--settle` and `--tail` (seconds).
+pub fn windows(args: &SyncArgs) -> Windows {
+    let d = Windows::default();
+    Windows {
+        settle: args.settle.unwrap_or(d.settle),
+        tail: args.tail.unwrap_or(d.tail),
+    }
+}
+
+/// Where a sync with no position starts: `--since`, else the newest recorded
+/// revision less the tail window, else 24 hours before `now`.
 ///
-/// A cycle ([`Syncer::cycle`]) polls recent changes from the cursor up to now
-/// and fetches the new revisions. The caller gives each cycle its own
-/// metadata sink and finishes it when the cycle returns, so that under
-/// `--ongoing` every cycle's metadata is complete on disk (a Parquet file is
-/// only readable once its footer is written) before the next poll starts.
+/// # Errors
+///
+/// When `--since` or the recorded timestamp is not a timestamp.
+pub fn start_time(args: &SyncArgs, latest_recorded: Option<&str>, now: u64) -> io::Result<u64> {
+    let parse = |s: &str, what: &str| {
+        revisionchest_meta::timestamp::normalize_utc(s)
+            .and_then(|n| mwrecent::parse_iso(&n))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{what} {s:?} is not a timestamp"),
+                )
+            })
+    };
+    Ok(match (&args.since, latest_recorded) {
+        (Some(s), _) => parse(s, "--since")?,
+        (None, Some(ts)) => parse(ts, "stored timestamp")?.saturating_sub(windows(args).tail),
+        (None, None) => now.saturating_sub(24 * 3600),
+    })
+}
+
+/// A bundle's committed length: compressed bytes, decompressed bytes.
+type Committed = (u64, u64);
+
+/// The position file's content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Position {
+    time: u64,
+    cont: Option<BTreeMap<String, String>>,
+    seen: Vec<(u64, u64)>,
+    bundles: BTreeMap<String, Committed>,
+    pending_parquet: Option<PathBuf>,
+}
+
+impl Position {
+    fn to_json(&self) -> Value {
+        json!({
+            "version": 1,
+            "time": mwrecent::iso(self.time),
+            "continue": self.cont,
+            "seen": self.seen,
+            "bundles": self.bundles,
+            "pending_parquet": self.pending_parquet,
+        })
+    }
+
+    fn from_json(v: &Value) -> Option<Self> {
+        if v["version"].as_u64() != Some(1) {
+            return None;
+        }
+        let time = mwrecent::parse_iso(v["time"].as_str()?)?;
+        let cont = serde_json::from_value(v["continue"].clone()).ok()?;
+        let seen = serde_json::from_value(v["seen"].clone()).ok()?;
+        let bundles = serde_json::from_value(v["bundles"].clone()).ok()?;
+        let pending_parquet = v["pending_parquet"].as_str().map(PathBuf::from);
+        Some(Self {
+            time,
+            cont,
+            seen,
+            bundles,
+            pending_parquet,
+        })
+    }
+}
+
+/// Writes `value` to `path` through a temporary file and a rename, so a
+/// reader sees the old file or the new one, never a torn write.
+fn write_atomic(path: &Path, value: &Value) -> io::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, serde_json::to_vec_pretty(value).map_err(other)?)?;
+    fs::File::open(&tmp)?.sync_all()?;
+    fs::rename(&tmp, path)
+}
+
+/// The decompressed length of a bundle: its sidecar, else measured.
+fn decompressed_len(path: &Path) -> io::Result<u64> {
+    match fs::read_to_string(mwrev::writer_sidecar_path(path)) {
+        Ok(s) => s.trim().parse().map_err(other),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            Ok(mwrev::recover::read_tail(path, 0, 0)?.decompressed_len)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// The bundles in `dir`, by file name.
+fn bundle_files(dir: &Path) -> io::Result<Vec<String>> {
+    let mut names = Vec::new();
+    if dir.is_dir() {
+        for entry in fs::read_dir(dir)? {
+            let name = entry?.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".mwrev.zst") {
+                names.push(name);
+            }
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
+/// The state a sync carries from one cycle to the next.
+///
+/// A cycle ([`Syncer::cycle`]) polls recent changes from the position up to
+/// now, fetches the new revisions and reports them and the log events. The
+/// caller gives each cycle its own metadata sink: it calls [`Syncer::begin`]
+/// before the cycle, naming the Parquet file the sink writes, and
+/// [`Syncer::commit`] once the sink has finished, which commits the cycle.
 pub struct Syncer<'a> {
     args: &'a SyncArgs,
-    cursor: DateTime<Utc>,
-    client: Client,
-    api: String,
-    namespaces: Option<String>,
+    wiki: Box<dyn Wiki + 'a>,
+    now: Box<dyn Fn() -> u64 + 'a>,
+    poller: Poller,
+    dir: PathBuf,
+    committed: BTreeMap<String, Committed>,
+    touched: BTreeSet<String>,
     processed: Cache<u64, ()>,
     already: AlreadyRecorded,
+    /// Metadata of a cycle that did not commit, reported again from the
+    /// bundles at the start of the next.
+    recovered: Vec<MetaEvent>,
 }
 
 impl<'a> Syncer<'a> {
-    /// Sets up a sync.
+    /// Sets up a sync: from the committed position when there is one (rolling
+    /// an interrupted cycle forward), else from [`start_time`]; then checks
+    /// the position against the oldest change the wiki still has.
     ///
-    /// `latest_recorded` is the newest revision timestamp already stored (from the
-    /// Postgres or Parquet metadata); polling starts `--overlap` minutes (default
-    /// 60) before it, or 24 hours ago when nothing is recorded, or at `--since`.
+    /// # Errors
+    ///
+    /// On a gap without `--accept-gap`, an unreadable position file, a bundle
+    /// shorter than its committed length, or a failed request.
     pub fn new(
         args: &'a SyncArgs,
+        wiki: Box<dyn Wiki + 'a>,
+        now: Box<dyn Fn() -> u64 + 'a>,
         latest_recorded: Option<String>,
         already: AlreadyRecorded,
     ) -> io::Result<Self> {
-        let overlap_mins = args
-            .overlap
-            .or_else(|| {
-                std::env::var("SYNC_OVERLAP")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-            })
-            .unwrap_or(60);
-
-        let cursor: DateTime<Utc> = match (&args.since, &latest_recorded) {
-            (Some(s), _) => parse_ts(s).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("--since {s:?} is not a timestamp"),
-                )
-            })?,
-            (None, Some(ts)) => {
-                let ts = parse_ts(ts).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("stored timestamp {ts:?} is not a timestamp"),
-                    )
-                })?;
-                if Utc::now() - ts > Duration::days(30) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!(
-                            "the most recent recorded revision ({ts}) is more than 30 days old; recent changes only go back 30 days — rebuild from a dump instead"
-                        ),
-                    ));
-                }
-                ts - Duration::minutes(overlap_mins as i64)
-            }
-            (None, None) => Utc::now() - Duration::hours(24),
-        };
-
-        let user_agent = format!(
-            "{}/{} ({})",
-            std::env::var("UA_APP_NAME").unwrap_or_else(|_| "RevisionChest".into()),
-            std::env::var("UA_APP_VERSION").unwrap_or_else(|_| env!("CARGO_PKG_VERSION").into()),
-            std::env::var("UA_CONTACT_INFO")
-                .or_else(|_| std::env::var("CONTACT_EMAIL"))
-                .unwrap_or_else(|_| "https://github.com/internetarchive/RevisionChest".into())
-        );
-        let client = Client::builder()
-            .user_agent(user_agent)
-            .build()
-            .map_err(other)?;
-        let api = format!("https://{}/w/api.php", args.domain);
-        let namespaces = args.namespace.as_ref().map(|ns| {
-            ns.iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join("|")
-        });
+        let dir = args.output_dir.join("recentchanges");
+        fs::create_dir_all(&dir)?;
+        let namespaces = args.namespace.clone().unwrap_or_default();
         let processed: Cache<u64, ()> = Cache::builder()
             .time_to_live(std::time::Duration::from_secs(25 * 3600))
             .build();
 
-        Ok(Self {
+        let position_path = dir.join(POSITION_FILE);
+        let stored = match fs::read(&position_path) {
+            Ok(bytes) => {
+                let v: Value = serde_json::from_slice(&bytes).map_err(other)?;
+                Some(Position::from_json(&v).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "{} is not a position this version reads",
+                            position_path.display()
+                        ),
+                    )
+                })?)
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+
+        let mut recovered = Vec::new();
+        let mut touched = BTreeSet::new();
+        let (poller, committed) = match stored {
+            Some(pos) => {
+                let committed =
+                    Self::roll_forward(&dir, &pos, &mut recovered, &mut touched, &processed)?;
+                let poller = Poller::restore(
+                    pos.time,
+                    pos.cont.clone(),
+                    pos.seen.clone(),
+                    namespaces.clone(),
+                    LIMIT,
+                    windows(args),
+                );
+                (poller, committed)
+            }
+            None => {
+                let start = start_time(args, latest_recorded.as_deref(), now())?;
+                let mut committed = BTreeMap::new();
+                for name in bundle_files(&dir)? {
+                    let path = dir.join(&name);
+                    committed.insert(name, (fs::metadata(&path)?.len(), decompressed_len(&path)?));
+                }
+                let poller = Poller::new(start, namespaces.clone(), LIMIT, windows(args));
+                (poller, committed)
+            }
+        };
+
+        let mut syncer = Self {
             args,
-            cursor,
-            client,
-            api,
-            namespaces,
+            wiki,
+            now,
+            poller: poller.coalesce(Coalesce::Off),
+            dir,
+            committed,
+            touched,
             processed,
             already,
-        })
+            recovered,
+        };
+        syncer.check_gap()?;
+        syncer.save(None)?;
+        Ok(syncer)
     }
 
-    /// One pass: polls recent changes from the cursor until the feed is
-    /// exhausted, fetching and appending the revisions not yet recorded, and
-    /// reporting them to `meta`. The cursor and the fetched-revision cache
-    /// carry over to the next cycle.
-    pub fn cycle(&mut self, meta: &MetaSender) -> io::Result<()> {
-        let args = self.args;
-        let mut rc_continue: Option<String> = None;
-        loop {
-            let start = self.cursor.format("%Y-%m-%dT%H:%M:%SZ").to_string();
-            log(&format!(
-                "Polling recent changes from {} (starting from {start})",
-                args.domain
-            ));
-            let mut params = vec![
-                ("action", "query"),
-                ("list", "recentchanges"),
-                ("rcstart", start.as_str()),
-                ("rcdir", "newer"),
-                ("rclimit", "500"),
-                ("rcprop", "ids|timestamp|title|userid|ns"),
-                ("format", "json"),
-                ("formatversion", "2"),
-            ];
-            if let Some(ns) = &self.namespaces {
-                params.push(("rcnamespace", ns));
-            }
-            if let Some(c) = &rc_continue {
-                params.push(("rccontinue", c));
-            }
-            let resp = request_with_retry(&self.client, &self.api, &params, args.max_retries)?;
-
-            let Some(rcs) = resp["query"]["recentchanges"].as_array() else {
-                break;
-            };
-            if rcs.is_empty() {
-                break;
-            }
-            if let Some(ts) = rcs
-                .last()
-                .and_then(|rc| rc["timestamp"].as_str())
-                .and_then(parse_ts)
-            {
-                self.cursor = ts;
-            }
-
-            for rc in rcs {
-                if let (Some(id), Some(ns), Some(title)) = (
-                    rc["pageid"].as_u64(),
-                    rc["ns"].as_i64(),
-                    rc["title"].as_str(),
-                ) {
-                    if args
-                        .namespace
-                        .as_ref()
-                        .is_none_or(|list| list.contains(&ns))
-                    {
-                        meta.send(MetaEvent::Page {
-                            id,
-                            ns,
-                            title: title.to_string(),
-                        });
-                    }
-                }
-            }
-
-            let wanted: Vec<u64> = rcs
-                .iter()
-                .filter_map(|rc| rc["revid"].as_u64())
-                .filter(|id| !self.processed.contains_key(id))
-                .collect();
-            let recorded = (self.already)(&wanted);
-            let wanted: Vec<u64> = wanted
-                .into_iter()
-                .filter(|id| !recorded.contains(id))
-                .collect();
-
-            for chunk in wanted.chunks(50) {
-                log(&format!("Fetching content for {} revisions", chunk.len()));
-                fetch_and_append(
-                    &self.client,
-                    &self.api,
-                    chunk,
-                    &args.output_dir,
-                    args.namespace.as_deref(),
-                    meta,
-                    args.max_retries,
-                )?;
-                for &id in chunk {
-                    self.processed.insert(id, ());
-                }
-            }
-            meta.send(MetaEvent::Finalize);
-
-            match resp["continue"]["rccontinue"].as_str() {
-                Some(c) => rc_continue = Some(c.to_string()),
-                None => break,
+    /// Rolls an interrupted cycle forward: reports again the revisions written
+    /// past each bundle's committed length, cuts back a frame cut off part
+    /// way, and removes the Parquet file the cycle was writing.
+    fn roll_forward(
+        dir: &Path,
+        pos: &Position,
+        recovered: &mut Vec<MetaEvent>,
+        touched: &mut BTreeSet<String>,
+        processed: &Cache<u64, ()>,
+    ) -> io::Result<BTreeMap<String, Committed>> {
+        if let Some(p) = &pos.pending_parquet {
+            match fs::remove_file(p) {
+                Ok(()) => log(&format!(
+                    "Removed {}, written by a cycle that did not commit",
+                    p.display()
+                )),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
             }
         }
+        let mut committed = pos.bundles.clone();
+        for name in bundle_files(dir)? {
+            let path = dir.join(&name);
+            let (c, d) = committed.get(&name).copied().unwrap_or((0, 0));
+            let len = fs::metadata(&path)?.len();
+            if len == c {
+                continue;
+            }
+            let tail = mwrev::recover::read_tail(&path, c, d)?;
+            if tail.incomplete {
+                log(&format!(
+                    "{name}: cutting back a frame cut off part way ({} bytes)",
+                    len - tail.compressed_len
+                ));
+            }
+            mwrev::recover::truncate(&path, tail.compressed_len, tail.decompressed_len)?;
+            if !tail.revisions.is_empty() {
+                log(&format!(
+                    "{name}: {} revisions written by a cycle that did not commit; reporting them again",
+                    tail.revisions.len()
+                ));
+            }
+            let file_path = format!("recentchanges/{name}");
+            for (h, loc) in tail.revisions {
+                processed.insert(h.rev_id, ());
+                recovered.push(MetaEvent::Revision {
+                    rev_id: h.rev_id,
+                    parent_rev_id: h.parent_rev_id,
+                    page_id: h.page_id,
+                    file_path: file_path.clone(),
+                    offset_begin: loc.offset_begin,
+                    length: loc.length,
+                    timestamp: h.timestamp,
+                });
+            }
+            // What was rolled forward commits with the next cycle.
+            committed.insert(name.clone(), (c, d));
+            touched.insert(name);
+        }
+        Ok(committed)
+    }
+
+    /// Refuses a position the wiki no longer keeps changes for: older than
+    /// `--rc-max-age` days before now, and older than the oldest change the wiki
+    /// still has. Within the window, an older position only means nothing
+    /// changed in between. `--accept-gap` moves the position to the oldest
+    /// change and records the gap.
+    fn check_gap(&mut self) -> io::Result<()> {
+        let mut params = vec![
+            ("action", "query"),
+            ("list", "recentchanges"),
+            ("rcdir", "newer"),
+            ("rclimit", "1"),
+            ("rcprop", "timestamp"),
+            ("format", "json"),
+            ("formatversion", "2"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect::<Vec<_>>();
+        if let Some(ns) = &self.args.namespace {
+            let ns = ns
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("|");
+            params.push(("rcnamespace".into(), ns));
+        }
+        let body = self.wiki.get(&params)?;
+        let v: Value = serde_json::from_str(&body).map_err(other)?;
+        let Some(oldest) = v["query"]["recentchanges"][0]["timestamp"]
+            .as_str()
+            .and_then(mwrecent::parse_iso)
+        else {
+            return Ok(()); // nothing retained, so nothing can be missed
+        };
+        let position = self.poller.time;
+        let retained_since = (self.now)().saturating_sub(self.args.rc_max_age * 86_400);
+        if oldest <= position || position >= retained_since {
+            return Ok(());
+        }
+        let (from, to) = (mwrecent::iso(position), mwrecent::iso(oldest));
+        if !self.args.accept_gap {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "gap: the sync's position is {from}, but the oldest change {} still has is {to}; \
+                     the changes between are gone. Rebuild that window from a dump, or pass \
+                     --accept-gap to resume from {to} and record the gap",
+                    self.args.domain
+                ),
+            ));
+        }
+        log(&format!("Accepting a gap from {from} to {to}"));
+        let record = json!({"from": from, "to": to, "recorded": mwrecent::iso((self.now)())});
+        let mut line = serde_json::to_string(&record).map_err(other)?;
+        line.push('\n');
+        use std::io::Write as _;
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.dir.join(GAPS_FILE))?
+            .write_all(line.as_bytes())?;
+        self.poller = Poller::new(
+            oldest,
+            self.args.namespace.clone().unwrap_or_default(),
+            LIMIT,
+            windows(self.args),
+        )
+        .coalesce(Coalesce::Off);
         Ok(())
+    }
+
+    fn save(&self, pending_parquet: Option<&Path>) -> io::Result<()> {
+        let pos = Position {
+            time: self.poller.time,
+            cont: self.poller.cont.clone(),
+            seen: self.poller.seen(),
+            bundles: self.committed.clone(),
+            pending_parquet: pending_parquet.map(Path::to_path_buf),
+        };
+        write_atomic(&self.dir.join(POSITION_FILE), &pos.to_json())
+    }
+
+    /// Before a cycle: records the Parquet file its sink writes, so a cycle
+    /// that does not commit can be rolled forward without duplicating rows.
+    ///
+    /// # Errors
+    ///
+    /// When the position cannot be written.
+    pub fn begin(&self, parquet: Option<&Path>) -> io::Result<()> {
+        self.save(parquet)
+    }
+
+    /// After the cycle's sink has finished: commits the bundles' lengths and
+    /// the poller's position.
+    ///
+    /// # Errors
+    ///
+    /// When a bundle cannot be measured or the position cannot be written.
+    pub fn commit(&mut self) -> io::Result<()> {
+        for name in std::mem::take(&mut self.touched) {
+            let path = self.dir.join(&name);
+            self.committed
+                .insert(name, (fs::metadata(&path)?.len(), decompressed_len(&path)?));
+        }
+        self.save(None)
+    }
+
+    /// One pass: reports what an interrupted cycle wrote, then polls recent
+    /// changes from the position until caught up, runs the tail pass, and
+    /// fetches and appends the revisions not yet recorded.
+    ///
+    /// # Errors
+    ///
+    /// When a request, a response or a bundle write fails. Nothing is committed
+    /// then, and the next start rolls forward what was written.
+    pub fn cycle(&mut self, meta: &MetaSender) -> io::Result<()> {
+        if !self.recovered.is_empty() {
+            for ev in std::mem::take(&mut self.recovered) {
+                meta.send(ev);
+            }
+            meta.send(MetaEvent::Finalize);
+        }
+        let now = (self.now)();
+        loop {
+            log(&format!(
+                "Polling recent changes from {} (from {})",
+                self.args.domain,
+                mwrecent::iso(self.poller.time)
+            ));
+            let query = self.poller.query(now, true);
+            let body = self.wiki.get(&query.params)?;
+            let batch = self.poller.read(&body, false).map_err(other)?;
+            self.handle(&batch.changes, meta)?;
+            if !batch.more {
+                break;
+            }
+        }
+        if let Some(query) = self.poller.tail_query(now, true) {
+            let body = self.wiki.get(&query.params)?;
+            let batch = self.poller.read(&body, true).map_err(other)?;
+            if !batch.changes.is_empty() {
+                log(&format!(
+                    "Tail pass: {} changes committed late",
+                    batch.changes.len()
+                ));
+            }
+            self.handle(&batch.changes, meta)?;
+        }
+        Ok(())
+    }
+
+    /// Reports the pages and log events of a batch, and fetches and appends
+    /// its revisions not yet recorded.
+    fn handle(&mut self, changes: &[Change], meta: &MetaSender) -> io::Result<()> {
+        let mut wanted = Vec::new();
+        for c in changes {
+            if let Some(id) = c.pageid {
+                meta.send(MetaEvent::Page {
+                    id,
+                    ns: c.ns,
+                    title: c.title.clone(),
+                });
+            }
+            match (&c.log, c.revid) {
+                (Some((log_type, log_action, params)), _) => meta.send(MetaEvent::Log {
+                    rcid: c.rcid,
+                    log_id: c.logid,
+                    log_type: log_type.clone(),
+                    log_action: log_action.clone(),
+                    page_id: c.pageid,
+                    ns: c.ns,
+                    title: c.title.clone(),
+                    timestamp: mwrecent::iso(c.time),
+                    params: params.as_ref().map(ToString::to_string),
+                }),
+                (None, Some(id)) if !self.processed.contains_key(&id) => wanted.push(id),
+                _ => {}
+            }
+        }
+        let recorded = (self.already)(&wanted);
+        let mut once = HashSet::new();
+        wanted.retain(|id| !recorded.contains(id) && once.insert(*id));
+        for chunk in wanted.chunks(FETCH_CHUNK) {
+            log(&format!("Fetching content for {} revisions", chunk.len()));
+            let by_day = self.fetch(chunk)?;
+            let names = append_revisions(by_day, &self.args.output_dir, meta)?;
+            self.touched.extend(names);
+            for &id in chunk {
+                self.processed.insert(id, ());
+            }
+        }
+        meta.send(MetaEvent::Finalize);
+        Ok(())
+    }
+
+    fn fetch(&self, rev_ids: &[u64]) -> io::Result<BTreeMap<String, Vec<Fetched>>> {
+        let ids = rev_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("|");
+        let params: Vec<(String, String)> = [
+            ("action", "query"),
+            ("prop", "revisions"),
+            ("revids", ids.as_str()),
+            ("rvprop", "ids|timestamp|user|content|userid|flags"),
+            ("rvslots", "main"),
+            ("format", "json"),
+            ("formatversion", "2"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let body = self.wiki.get(&params)?;
+        let resp: Value = serde_json::from_str(&body).map_err(other)?;
+        Ok(parse_revisions(&resp, self.args.namespace.as_deref()))
     }
 }
 
 struct Fetched {
     header: RevisionHeader,
     text: String,
-}
-
-fn fetch_and_append(
-    client: &Client,
-    api: &str,
-    rev_ids: &[u64],
-    output_dir: &Path,
-    namespaces: Option<&[i64]>,
-    meta: &MetaSender,
-    max_retries: u32,
-) -> io::Result<()> {
-    if rev_ids.is_empty() {
-        return Ok(());
-    }
-    let ids = rev_ids
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join("|");
-    let params: Vec<(&str, &str)> = vec![
-        ("action", "query"),
-        ("prop", "revisions"),
-        ("revids", ids.as_str()),
-        ("rvprop", "ids|timestamp|user|content|userid|flags"),
-        ("rvslots", "main"),
-        ("format", "json"),
-        ("formatversion", "2"),
-    ];
-    let resp = request_with_retry(client, api, &params, max_retries)?;
-    let by_day = parse_revisions(&resp, namespaces);
-    append_revisions(by_day, output_dir, meta)
 }
 
 /// The revisions in a `prop=revisions` (formatversion=2) response, grouped by
@@ -358,14 +701,16 @@ fn parse_revisions(resp: &Value, namespaces: Option<&[i64]>) -> BTreeMap<String,
     by_day
 }
 
-/// Appends the revisions to `<output>/recentchanges/<day>.mwrev.zst` and reports where each landed.
+/// Appends the revisions to `<output>/recentchanges/<day>.mwrev.zst`, reports
+/// where each landed, and returns the bundles' file names.
 fn append_revisions(
     by_day: BTreeMap<String, Vec<Fetched>>,
     output_dir: &Path,
     meta: &MetaSender,
-) -> io::Result<()> {
+) -> io::Result<Vec<String>> {
     let rc_dir = output_dir.join("recentchanges");
     fs::create_dir_all(&rc_dir)?;
+    let mut names = Vec::new();
     for (day, revisions) in by_day {
         let file_name = format!("{day}.mwrev.zst");
         let relative = format!("recentchanges/{file_name}");
@@ -382,151 +727,11 @@ fn append_revisions(
                 timestamp: f.header.timestamp.clone(),
             });
         }
-        writer.finish()?;
+        writer.finish()?.sync_all()?;
+        names.push(file_name);
     }
-    Ok(())
+    Ok(names)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use revisionchest_meta::{MetaSink, SinkError};
-    use std::sync::{Arc, Mutex};
-
-    struct Collect(Arc<Mutex<Vec<MetaEvent>>>);
-    impl MetaSink for Collect {
-        fn handle(&mut self, e: MetaEvent) -> Result<(), SinkError> {
-            self.0.lock().unwrap().push(e);
-            Ok(())
-        }
-        fn finish(self: Box<Self>) -> Result<(), SinkError> {
-            Ok(())
-        }
-    }
-
-    fn api_response(revs: &[(u64, u64, Option<u64>, &str, &str)]) -> Value {
-        // (page_id, rev_id, parent, timestamp, text), all in page 7 / ns 0 unless page_id differs
-        let mut pages = serde_json::Map::new();
-        for (page_id, rev_id, parent, ts, text) in revs {
-            let page = pages.entry(page_id.to_string()).or_insert_with(|| serde_json::json!({"pageid": page_id, "ns": 0, "title": format!("P{page_id}"), "revisions": []}));
-            page["revisions"]
-                .as_array_mut()
-                .unwrap()
-                .push(serde_json::json!({
-                    "revid": rev_id, "parentid": parent.unwrap_or(0), "timestamp": ts, "userid": 42,
-                    "slots": {"main": {"content": text, "contentmodel": "wikitext"}}
-                }));
-        }
-        serde_json::json!({"query": {"pages": pages.values().cloned().collect::<Vec<_>>()}})
-    }
-
-    #[test]
-    fn appended_offsets_locate_each_revision_across_batches_and_days() {
-        let dir = tempfile::tempdir().unwrap();
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let (meta, handle) = revisionchest_meta::spawn(Box::new(Collect(events.clone())), 16);
-
-        let batch1 = api_response(&[
-            (
-                7,
-                100,
-                None,
-                "2026-10-18T23:59:00Z",
-                "late on the 18th\nsecond line",
-            ),
-            (
-                7,
-                101,
-                Some(100),
-                "2026-10-19T00:00:10Z",
-                "first on the 19th",
-            ),
-            (8, 200, None, "2026-10-19T01:00:00Z", "another page\n"),
-        ]);
-        let batch2 = api_response(&[(
-            7,
-            102,
-            Some(101),
-            "2026-10-19T02:00:00Z",
-            "a later batch appends a new frame",
-        )]);
-        append_revisions(parse_revisions(&batch1, None), dir.path(), &meta).unwrap();
-        append_revisions(parse_revisions(&batch2, None), dir.path(), &meta).unwrap();
-        drop(meta);
-        handle.join().unwrap();
-
-        let events = events.lock().unwrap();
-        let revs: Vec<_> = events
-            .iter()
-            .filter_map(|e| match e {
-                MetaEvent::Revision {
-                    rev_id,
-                    file_path,
-                    offset_begin,
-                    length,
-                    ..
-                } => Some((*rev_id, file_path.clone(), *offset_begin, *length)),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            revs.iter().map(|r| r.0).collect::<Vec<_>>(),
-            vec![100, 101, 200, 102]
-        );
-        assert_eq!(revs[0].1, "recentchanges/2026-10-18.mwrev.zst");
-        assert_eq!(revs[1].1, "recentchanges/2026-10-19.mwrev.zst");
-
-        // Every recorded location must read back exactly that revision's text lines,
-        // including the one appended as a second zstd frame.
-        let expected = [
-            (100u64, " late on the 18th\n second line\n"),
-            (101, " first on the 19th\n"),
-            (200, " another page\n"),
-            (102, " a later batch appends a new frame\n"),
-        ];
-        for ((rev_id, file_path, off, len), (exp_id, exp_text)) in revs.iter().zip(expected) {
-            assert_eq!(*rev_id, exp_id);
-            let bytes = mwrev::read_at(&dir.path().join(file_path), *off, *len).unwrap();
-            assert_eq!(String::from_utf8(bytes).unwrap(), exp_text, "rev {rev_id}");
-        }
-        // and the daily bundle reads back as three revisions in order
-        let ids: Vec<u64> =
-            mwrev::open_bundle(&dir.path().join("recentchanges/2026-10-19.mwrev.zst"))
-                .unwrap()
-                .map(|r| r.unwrap().0.rev_id)
-                .collect();
-        assert_eq!(ids, vec![101, 200, 102]);
-    }
-
-    #[test]
-    fn namespace_filter_and_bad_rows() {
-        let mut resp = api_response(&[(7, 1, None, "2026-10-19T00:00:00Z", "x")]);
-        resp["query"]["pages"][0]["ns"] = serde_json::json!(118);
-        assert!(parse_revisions(&resp, Some(&[0])).is_empty());
-        assert_eq!(parse_revisions(&resp, Some(&[0, 118])).len(), 1);
-        let resp = api_response(&[(7, 0, None, "", "x")]);
-        assert!(parse_revisions(&resp, None).is_empty());
-    }
-
-    #[test]
-    fn hidden_text_is_flagged_not_read_as_blank() {
-        let resp = serde_json::json!({"query": {"pages": [{
-            "pageid": 7, "ns": 0, "title": "P7",
-            "revisions": [
-                {"revid": 100, "parentid": 0, "timestamp": "2026-10-19T00:00:00Z", "userid": 42,
-                 "slots": {"main": {"content": "", "contentmodel": "wikitext"}}},
-                {"revid": 101, "parentid": 100, "timestamp": "2026-10-19T00:01:00Z", "userid": 42,
-                 "slots": {"main": {"texthidden": true}}}
-            ]
-        }]}});
-        let by_day = parse_revisions(&resp, None);
-        let revs = &by_day["2026-10-19"];
-        assert!(
-            !revs[0].header.text_hidden,
-            "a blank revision is not hidden"
-        );
-        assert!(revs[1].header.text_hidden);
-        assert_eq!(revs[1].text, "");
-        assert!(revs[1].header.to_line().ends_with(" text_hidden=1"));
-    }
-}
+mod tests;

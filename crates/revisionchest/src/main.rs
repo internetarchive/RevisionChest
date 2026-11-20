@@ -91,14 +91,20 @@ fn parquet_target(path: &Path) -> PathBuf {
 }
 
 fn make_sink(meta: &MetaArgs) -> io::Result<Box<dyn MetaSink>> {
+    let target = meta.parquet.as_deref().map(parquet_target);
+    make_sink_at(meta, target.as_deref())
+}
+
+/// The sink, writing Parquet to `target` (chosen by the caller, who may need
+/// to know it beforehand).
+fn make_sink_at(meta: &MetaArgs, target: Option<&Path>) -> io::Result<Box<dyn MetaSink>> {
     let mut sinks: Vec<Box<dyn MetaSink>> = Vec::new();
-    if let Some(p) = &meta.parquet {
-        let target = parquet_target(p);
+    if let Some(target) = target {
         if let Some(parent) = target.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)?;
         }
         sinks.push(Box::new(
-            ParquetSink::create(&target).map_err(io::Error::other)?,
+            ParquetSink::create(target).map_err(io::Error::other)?,
         ));
         log(&format!("Metadata → {}", target.display()));
     }
@@ -220,7 +226,22 @@ fn main() -> io::Result<()> {
             if latest.is_none() {
                 if let Some(p) = &s.meta.parquet {
                     latest = latest_parquet_timestamp(p);
+                    // Without a position, sync starts before the newest recorded
+                    // revision; what the Parquet metadata already records since
+                    // then is not fetched again.
+                    let now = chrono::Utc::now().timestamp().max(0) as u64;
+                    let start = sync::start_time(&s, latest.as_deref(), now)?;
+                    let recorded = parquet_revisions_since(p, &mwrecent::iso(start));
+                    already = Box::new(move |ids: &[u64]| {
+                        ids.iter()
+                            .copied()
+                            .filter(|id| recorded.contains(id))
+                            .collect()
+                    });
                 }
+            }
+            if s.overlap.is_some() {
+                log("--overlap is replaced by the committed position and --tail; ignoring it");
             }
 
             // Each cycle gets its own sink, finished before the next poll, so an
@@ -236,9 +257,13 @@ fn main() -> io::Result<()> {
                     std::process::exit(2);
                 }
             }
-            let mut syncer = sync::Syncer::new(&s, latest, already)?;
+            let wiki = Box::new(sync::HttpWiki::new(&s.domain, s.max_retries)?);
+            let now = Box::new(|| chrono::Utc::now().timestamp().max(0) as u64);
+            let mut syncer = sync::Syncer::new(&s, wiki, now, latest, already)?;
             loop {
-                let sink = make_sink(&s.meta)?;
+                let target = s.meta.parquet.as_deref().map(parquet_target);
+                syncer.begin(target.as_deref())?;
+                let sink = make_sink_at(&s.meta, target.as_deref())?;
                 let (meta, handle) = revisionchest_meta::spawn(sink, 10_000);
                 meta.send(MetaEvent::SiteInfo {
                     domain: s.domain.clone(),
@@ -249,6 +274,8 @@ fn main() -> io::Result<()> {
                 let sink_result = handle.join();
                 result?;
                 sink_result.map_err(io::Error::other)?;
+                // The bundles and the metadata are written: commit the cycle.
+                syncer.commit()?;
 
                 if !s.ongoing {
                     break;
@@ -262,6 +289,29 @@ fn main() -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The `*.parquet` files of a path: the file, or every one in the directory.
+fn parquet_files(path: &Path) -> Vec<PathBuf> {
+    if path.is_dir() {
+        std::fs::read_dir(path)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "parquet"))
+            .collect()
+    } else {
+        vec![path.to_path_buf()]
+    }
+}
+
+/// The revisions the Parquet metadata records at or after `since`.
+fn parquet_revisions_since(path: &Path, since: &str) -> HashSet<u64> {
+    parquet_files(path)
+        .iter()
+        .flat_map(|p| revisionchest_meta::parquet::revisions_since(p, since))
+        .collect()
 }
 
 /// Latest revision timestamp across a Parquet file, or every `*.parquet` in a directory.

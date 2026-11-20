@@ -19,6 +19,7 @@ postgres = ["revisionchest-meta/postgres"]
 [dependencies]
 mwdump.workspace = true
 mwrev.workspace = true
+mwrecent.workspace = true
 revisionchest-meta = { workspace = true, features = ["parquet"] }
 clap.workspace = true
 rayon.workspace = true

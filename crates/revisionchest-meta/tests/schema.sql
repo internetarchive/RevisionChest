@@ -44,3 +44,17 @@ CREATE TABLE web_resources (
     numeric_page_id      INTEGER,
     numeric_namespace_id INTEGER
 );
+CREATE TABLE log_events (
+    domain_id      INTEGER NOT NULL REFERENCES domains(id),
+    rcid           BIGINT NOT NULL,
+    log_id         BIGINT,
+    log_type       VARCHAR NOT NULL,
+    log_action     VARCHAR NOT NULL,
+    page_id        INTEGER,
+    page_namespace INTEGER,
+    page_title     VARCHAR,
+    log_timestamp  TIMESTAMP NOT NULL,
+    log_params     JSONB,
+    PRIMARY KEY (domain_id, rcid)
+);
+CREATE INDEX idx_log_events_page ON log_events (domain_id, page_id);
