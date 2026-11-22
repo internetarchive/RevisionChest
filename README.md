@@ -102,7 +102,12 @@ Each kind of error has its own mechanism:
   way is cut back, and the cycle's unfinished Parquet file is removed. A sync
   with no position starts at `--since`, else `--tail` seconds before the
   newest recorded revision (what is already recorded is not fetched again),
-  else 24 hours ago. `--overlap` is gone.
+  else 24 hours ago. `--overlap` is gone. A cycle still behind after
+  `--commit-every` minutes (default 10; 0 for never) stops after the batch in
+  hand and commits, and the next continues from the committed continuation,
+  so a restart during a long catch-up resumes from its last commit instead
+  of re-reading the backlog. Metadata written to a single `--parquet` file
+  keeps one cycle, since the next would overwrite it.
 - **Gaps.** A wiki keeps recent changes for `--rc-max-age` days (30 on
   Wikimedia wikis, MediaWiki's default 90). A position older than that, and
   older than the oldest change the wiki still has, cannot be resumed without
