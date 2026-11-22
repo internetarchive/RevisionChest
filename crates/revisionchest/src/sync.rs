@@ -69,8 +69,9 @@ pub trait Wiki {
     fn get(&self, params: &[(String, String)]) -> io::Result<String>;
 }
 
-/// The Action API over HTTP, retrying a response that is not JSON (a truncated
-/// or HTML error body) with exponential backoff.
+/// The Action API over HTTP, retrying with exponential backoff both a request
+/// that fails (a connection refused or dropped, a body cut off while it was
+/// read) and a response that is not JSON (a truncated or HTML error body).
 pub struct HttpWiki {
     client: Client,
     api: String,
@@ -93,13 +94,26 @@ impl HttpWiki {
                 .or_else(|_| std::env::var("CONTACT_EMAIL"))
                 .unwrap_or_else(|_| "https://github.com/internetarchive/RevisionChest".into())
         );
+        Self::with_api(
+            format!("https://{domain}/w/api.php"),
+            &user_agent,
+            max_retries,
+        )
+    }
+
+    /// The API at `api`, sending `user_agent`.
+    ///
+    /// # Errors
+    ///
+    /// When the HTTP client cannot be built.
+    pub fn with_api(api: String, user_agent: &str, max_retries: u32) -> io::Result<Self> {
         let client = Client::builder()
             .user_agent(user_agent)
             .build()
             .map_err(other)?;
         Ok(Self {
             client,
-            api: format!("https://{domain}/w/api.php"),
+            api,
             max_retries,
         })
     }
@@ -108,31 +122,34 @@ impl HttpWiki {
 impl Wiki for HttpWiki {
     fn get(&self, params: &[(String, String)]) -> io::Result<String> {
         for attempt in 0..=self.max_retries {
-            let body = self
+            let failure = match self
                 .client
                 .get(&self.api)
                 .query(params)
                 .send()
                 .and_then(reqwest::blocking::Response::text)
-                .map_err(other)?;
-            match serde_json::from_str::<Value>(&body) {
-                Ok(_) => return Ok(body),
-                Err(e) if attempt < self.max_retries => {
-                    let delay = std::time::Duration::from_secs(2u64.pow(attempt.min(20)));
-                    log(&format!(
-                        "Failed to decode response (attempt {}/{}): {e}. Retrying in {delay:?}",
-                        attempt + 1,
-                        self.max_retries + 1
-                    ));
-                    std::thread::sleep(delay);
-                }
-                Err(e) => {
-                    return Err(other(format!(
-                        "failed to decode response after {} attempts: {e}",
-                        self.max_retries + 1
-                    )));
-                }
+            {
+                Ok(body) => match serde_json::from_str::<Value>(&body) {
+                    Ok(_) => return Ok(body),
+                    Err(e) => format!("failed to decode response: {e}"),
+                },
+                // a transport error ends no cycle: a dropped connection or a body cut
+                // off part way is as transient as a truncated one
+                Err(e) => format!("request failed: {e}"),
+            };
+            if attempt == self.max_retries {
+                return Err(other(format!(
+                    "{failure} (after {} attempts)",
+                    self.max_retries + 1
+                )));
             }
+            let delay = std::time::Duration::from_secs(2u64.pow(attempt.min(20)));
+            log(&format!(
+                "{failure} (attempt {}/{}). Retrying in {delay:?}",
+                attempt + 1,
+                self.max_retries + 1
+            ));
+            std::thread::sleep(delay);
         }
         unreachable!("loop returns on the last attempt")
     }
