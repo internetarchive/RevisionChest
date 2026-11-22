@@ -19,6 +19,9 @@ impl MetaSink for Collect {
 /// 2026-10-19T00:00:00Z
 const T0: u64 = 1_792_368_000;
 
+/// A clock and the seconds each list request moves it on.
+type Tick = (Arc<AtomicU64>, u64);
+
 /// A revision the fake wiki serves: its page, its text (`None` when hidden), its time.
 type FakeRevision = (u64, Option<String>, u64);
 
@@ -30,6 +33,8 @@ struct FakeWiki {
     revisions: Arc<Mutex<HashMap<u64, FakeRevision>>>,
     oldest: Arc<Mutex<Option<u64>>>,
     fetched: Arc<Mutex<Vec<u64>>>,
+    /// A clock each `list=recentchanges` request moves on, and by how much.
+    tick: Arc<Mutex<Option<Tick>>>,
 }
 
 impl FakeWiki {
@@ -86,6 +91,9 @@ impl Wiki for FakeWiki {
             return Ok(json!({"query": {"pages": pages}}).to_string());
         }
         // list=recentchanges, oldest first
+        if let Some((clock, by)) = &*self.tick.lock().unwrap() {
+            clock.fetch_add(*by, Ordering::SeqCst);
+        }
         let oldest = *self.oldest.lock().unwrap();
         let mut rows: Vec<Value> = self
             .rows
@@ -157,16 +165,27 @@ fn syncer<'a>(args: &'a SyncArgs, wiki: &FakeWiki, now: &Arc<AtomicU64>) -> io::
 /// One cycle as `main` runs it; `commit: false` stops before the commit, as a
 /// crash would.
 fn run(s: &mut Syncer, commit: bool, parquet: Option<&Path>) -> Vec<MetaEvent> {
+    run_bounded(s, commit, parquet, None).0
+}
+
+/// [`run`] with a cycle budget (seconds); also returns whether it caught up.
+fn run_bounded(
+    s: &mut Syncer,
+    commit: bool,
+    parquet: Option<&Path>,
+    budget: Option<u64>,
+) -> (Vec<MetaEvent>, bool) {
     let events = Arc::new(Mutex::new(Vec::new()));
     s.begin(parquet).unwrap();
     let (meta, handle) = revisionchest_meta::spawn(Box::new(Collect(events.clone())), 64);
-    s.cycle(&meta).unwrap();
+    let caught_up = s.cycle(&meta, budget).unwrap();
     drop(meta);
     handle.join().unwrap();
     if commit {
         s.commit().unwrap();
     }
-    events.lock().unwrap().clone()
+    let events = events.lock().unwrap().clone();
+    (events, caught_up)
 }
 
 fn revisions(events: &[MetaEvent]) -> Vec<u64> {
@@ -500,4 +519,87 @@ fn namespace_filter_and_bad_rows() {
     assert!(parse_revisions(&r, Some(&[0])).is_empty());
     assert_eq!(parse_revisions(&r, Some(&[0, 118])).len(), 1);
     assert!(parse_revisions(&resp(0, 0, ""), None).is_empty());
+}
+
+#[test]
+fn a_long_catch_up_commits_as_it_goes_and_resumes_from_its_last_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = args(dir.path(), &[]);
+    let wiki = FakeWiki::default();
+    let now = Arc::new(AtomicU64::new(T0 + 100_000));
+    let n: u64 = 1_400; // three list requests of 500
+    for i in 1..=n {
+        wiki.edit(i, 1_000 + i, i % 7, T0 + i * 10, Some("text"));
+    }
+    // every list request takes a minute; a cycle commits once it has run one
+    *wiki.tick.lock().unwrap() = Some((now.clone(), 60));
+    let budget = Some(60);
+
+    // the first cycle stops behind, after its first batch, and commits it with
+    // the continuation
+    let mut s = syncer(&a, &wiki, &now).unwrap();
+    let (first, caught_up) = run_bounded(&mut s, true, None, budget);
+    assert!(!caught_up);
+    assert_eq!(revisions(&first).len(), 500);
+    let pos: Value =
+        serde_json::from_slice(&fs::read(dir.path().join("recentchanges/position.json")).unwrap())
+            .unwrap();
+    assert!(pos["continue"].is_object(), "{pos}");
+
+    // the second does not commit (a crash); a restart rolls its batch forward
+    // from the bundle and reads on from the first commit, not from the start
+    let (second, caught_up) = run_bounded(&mut s, false, None, budget);
+    assert!(!caught_up);
+    assert_eq!(revisions(&second).len(), 500);
+    drop(s);
+    let lists_before = wiki.fetched().len();
+    let mut s = syncer(&a, &wiki, &now).unwrap();
+    let mut rest = Vec::new();
+    loop {
+        let (events, caught_up) = run_bounded(&mut s, true, None, budget);
+        rest.extend(revisions(&events));
+        if caught_up {
+            break;
+        }
+    }
+    // revisions 501..=1000 reported again from the bundle, the rest fetched now
+    assert_eq!(rest.len(), 900);
+    let fetched = wiki.fetched();
+    assert_eq!(
+        fetched.len(),
+        usize::try_from(n).unwrap(),
+        "each revision fetched once"
+    );
+    assert_eq!(fetched.len() - lists_before, 400);
+
+    let mut ids: Vec<u64> = std::fs::read_dir(dir.path().join("recentchanges"))
+        .unwrap()
+        .filter_map(|e| {
+            let name = e.unwrap().file_name().into_string().unwrap();
+            name.strip_suffix(".mwrev.zst").map(str::to_string)
+        })
+        .flat_map(|day| bundle_ids(dir.path(), &day))
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        (1_001..=1_000 + n).collect::<Vec<_>>(),
+        "every revision in the bundles once"
+    );
+}
+
+#[test]
+fn an_unbounded_cycle_reads_the_whole_backlog() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = args(dir.path(), &[]);
+    let wiki = FakeWiki::default();
+    let now = Arc::new(AtomicU64::new(T0 + 100_000));
+    for i in 1..=1_200 {
+        wiki.edit(i, 1_000 + i, 1, T0 + i * 10, Some("text"));
+    }
+    *wiki.tick.lock().unwrap() = Some((now.clone(), 60));
+    let mut s = syncer(&a, &wiki, &now).unwrap();
+    let (events, caught_up) = run_bounded(&mut s, true, None, None);
+    assert!(caught_up);
+    assert_eq!(revisions(&events).len(), 1_200);
 }

@@ -16,7 +16,9 @@
 //!   revisions in the bundles past their committed length are reported again
 //!   from the bundles, a frame cut off part way is cut back, the unfinished
 //!   Parquet file is removed, and the poller resumes from the committed
-//!   position. Nothing is fetched or appended twice.
+//!   position. Nothing is fetched or appended twice. A cycle still behind
+//!   after `--commit-every` minutes stops and commits, so a long catch-up
+//!   is rolled forward from its last commit, not from its start.
 //! - *Gaps*: a position older than the wiki keeps recent changes
 //!   (`--rc-max-age`), and older than its oldest retained change, cannot be
 //!   resumed without missing revisions. `sync` refuses to start;
@@ -540,13 +542,16 @@ impl<'a> Syncer<'a> {
 
     /// One pass: reports what an interrupted cycle wrote, then polls recent
     /// changes from the position until caught up, runs the tail pass, and
-    /// fetches and appends the revisions not yet recorded.
+    /// fetches and appends the revisions not yet recorded. With a `budget`
+    /// (seconds), a pass still behind once it has run that long stops after
+    /// the batch in hand, without the tail pass; the caller commits it and
+    /// starts the next from the continuation. Returns whether it caught up.
     ///
     /// # Errors
     ///
     /// When a request, a response or a bundle write fails. Nothing is committed
     /// then, and the next start rolls forward what was written.
-    pub fn cycle(&mut self, meta: &MetaSender) -> io::Result<()> {
+    pub fn cycle(&mut self, meta: &MetaSender, budget: Option<u64>) -> io::Result<bool> {
         if !self.recovered.is_empty() {
             for ev in std::mem::take(&mut self.recovered) {
                 meta.send(ev);
@@ -567,6 +572,14 @@ impl<'a> Syncer<'a> {
             if !batch.more {
                 break;
             }
+            if budget.is_some_and(|b| (self.now)().saturating_sub(now) >= b) {
+                log(&format!(
+                    "Behind after {} s, at {}: committing, then continuing",
+                    (self.now)().saturating_sub(now),
+                    mwrecent::iso(self.poller.time)
+                ));
+                return Ok(false);
+            }
         }
         if let Some(query) = self.poller.tail_query(now, true) {
             let body = self.wiki.get(&query.params)?;
@@ -579,7 +592,7 @@ impl<'a> Syncer<'a> {
             }
             self.handle(&batch.changes, meta)?;
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Reports the pages and log events of a batch, and fetches and appends

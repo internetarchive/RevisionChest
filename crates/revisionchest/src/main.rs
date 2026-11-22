@@ -260,6 +260,10 @@ fn main() -> io::Result<()> {
             let wiki = Box::new(sync::HttpWiki::new(&s.domain, s.max_retries)?);
             let now = Box::new(|| chrono::Utc::now().timestamp().max(0) as u64);
             let mut syncer = sync::Syncer::new(&s, wiki, now, latest, already)?;
+            // A cycle still behind after --commit-every minutes commits and the next
+            // continues, unless the metadata goes to one file the next would overwrite.
+            let one_file = s.meta.parquet.as_ref().is_some_and(|p| !p.is_dir());
+            let budget = (s.commit_every > 0 && !one_file).then_some(s.commit_every * 60);
             loop {
                 let target = s.meta.parquet.as_deref().map(parquet_target);
                 syncer.begin(target.as_deref())?;
@@ -269,13 +273,16 @@ fn main() -> io::Result<()> {
                     domain: s.domain.clone(),
                     language_code: None,
                 });
-                let result = syncer.cycle(&meta);
+                let result = syncer.cycle(&meta, budget);
                 drop(meta);
                 let sink_result = handle.join();
-                result?;
+                let caught_up = result?;
                 sink_result.map_err(io::Error::other)?;
                 // The bundles and the metadata are written: commit the cycle.
                 syncer.commit()?;
+                if !caught_up {
+                    continue;
+                }
 
                 if !s.ongoing {
                     break;

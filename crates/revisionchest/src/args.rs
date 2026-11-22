@@ -123,6 +123,15 @@ pub struct SyncArgs {
     #[arg(long, default_value = "15")]
     pub max_retries: u32,
 
+    /// Minutes after which a cycle that has not caught up stops, commits what
+    /// it has fetched, and the next cycle continues from the committed
+    /// position, so a restart during a long catch-up resumes from there
+    /// instead of re-reading the backlog (default: 10; 0 commits only once
+    /// caught up; a single --parquet file always keeps one cycle, which the
+    /// next would overwrite)
+    #[arg(long, default_value = "10")]
+    pub commit_every: u64,
+
     /// Start from this timestamp (YYYY-MM-DDTHH:MM:SSZ) when there is no
     /// committed position (recentchanges/position.json), instead of the latest
     /// recorded revision less --tail
