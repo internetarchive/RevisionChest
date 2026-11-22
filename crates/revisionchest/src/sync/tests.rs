@@ -501,3 +501,44 @@ fn namespace_filter_and_bad_rows() {
     assert_eq!(parse_revisions(&r, Some(&[0, 118])).len(), 1);
     assert!(parse_revisions(&resp(0, 0, ""), None).is_empty());
 }
+
+/// A server on a local port answering connection `i` with `replies[i]`: `None`
+/// closes the connection without a response, `Some(body)` sends it as JSON.
+fn flaky_server(replies: Vec<Option<&'static str>>) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for reply in replies {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = conn.read(&mut buf);
+            if let Some(body) = reply {
+                let _ = write!(
+                    conn,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        }
+    });
+    format!("http://{addr}/w/api.php")
+}
+
+#[test]
+fn http_wiki_retries_a_dropped_connection() {
+    let api = flaky_server(vec![None, Some(r#"{"batchcomplete":true}"#)]);
+    let wiki = HttpWiki::with_api(api, "test", 2).unwrap();
+    assert_eq!(wiki.get(&[]).unwrap(), r#"{"batchcomplete":true}"#);
+}
+
+#[test]
+fn http_wiki_gives_up_after_max_retries() {
+    let api = flaky_server(vec![None, None]);
+    let wiki = HttpWiki::with_api(api, "test", 1).unwrap();
+    let err = wiki.get(&[]).unwrap_err().to_string();
+    assert!(
+        err.contains("request failed") && err.contains("after 2 attempts"),
+        "{err}"
+    );
+}
