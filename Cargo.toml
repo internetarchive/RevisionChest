@@ -25,7 +25,7 @@ revisionchest-meta = { path = "crates/revisionchest-meta" }
 quick-xml = "0.42"
 bzip2 = "0.6"
 flate2 = "1"
-sevenz-rust2 = { version = "0.20.2", default-features = false }
+sevenz-rust2 = { version = "0.21.1", default-features = false }
 # bundles
 zstd = "0.13"
 # MediaWiki's base-36 SHA-1 of a revision, written by mwdump's writer
